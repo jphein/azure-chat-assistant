@@ -20,11 +20,13 @@ import json
 import os
 import sys
 import time
+import sqlite3
 import httpx
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
 CONFIG_PATH = os.path.expanduser("~/.config/azure-voice-assistant/config.json")
+DB_PATH = os.path.expanduser("~/.config/azure-voice-assistant/sessions.db")
 
 DEFAULTS = {
     "api_key": "",
@@ -37,11 +39,70 @@ DEFAULTS = {
     "system_prompt": "You are a helpful voice assistant. Keep responses concise and conversational.",
     "conversation_max_turns": 50,    # max history turns before auto-trimming
     "voice": "",                     # default TTS voice (empty = use speech config)
+    "default_models": ["gpt-5.3-chat", "Meta-Llama-3.1-405B-Instruct", "Phi-4"],  # models for multi_chat when none specified
+    "multi_chat_timeout": 15,        # per-model timeout in seconds for multi_chat
 }
 
 CONFIG = {}
 _conversation_history = []          # list of {"role": ..., "content": ...}
+_cache = {}                         # simple in-memory cache for static responses
+_model_status = {}                  # track last error/status per model
 _stdout_lock = asyncio.Lock()
+CURRENT_SESSION = "default"
+
+# ── DB management ───────────────────────────────────────────────────────────
+
+def init_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                name TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_name TEXT,
+                role TEXT,
+                content TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (session_name) REFERENCES sessions(name) ON DELETE CASCADE
+            )
+        """)
+        # Ensure default session exists
+        conn.execute("INSERT OR IGNORE INTO sessions (name) VALUES ('default')")
+
+def get_history(session_name):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.execute(
+                "SELECT role, content FROM messages WHERE session_name = ? ORDER BY id ASC",
+                (session_name,)
+            )
+            return [{"role": r, "content": c} for r, c in cursor.fetchall()]
+    except Exception:
+        return []
+
+def add_message(session_name, role, content):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO messages (session_name, role, content) VALUES (?, ?, ?)",
+                (session_name, role, content)
+            )
+    except Exception:
+        pass
+
+def clear_session(session_name):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM messages WHERE session_name = ?", (session_name,))
+    except Exception:
+        pass
+
+init_db()
 
 # ── Config management ───────────────────────────────────────────────────────
 
@@ -124,7 +185,7 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
     }
 
     if progress_token:
-        await _send_progress(progress_token, 0.1, "Thinking...")
+        await _send_progress(progress_token, 0.1, f"[{model}] Thinking...")
 
     t0 = time.perf_counter()
     
@@ -144,8 +205,21 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
         try:
             async with client.stream("POST", url, json=body, headers=headers, timeout=60.0) as resp:
                 state["status_code"] = resp.status_code
-                if resp.status_code != 200:
+                if resp.status_code == 200:
+                    _model_status[model] = "OK"
+                elif resp.status_code == 429:
+                    _model_status[model] = "Rate Limited"
+                    state["error"] = f"**[{model}]** is currently resting (Rate Limit hit). Please try another model or wait a moment."
+                    await queue.put(SENTINEL)
+                    return
+                elif resp.status_code == 400:
+                    _model_status[model] = "Filter Triggered"
+                    state["error"] = f"**[{model}]** declined to answer (Content Filter). Try rephrasing your request."
+                    await queue.put(SENTINEL)
+                    return
+                else:
                     body_text = await resp.aread()
+                    _model_status[model] = f"Error {resp.status_code}"
                     state["error"] = f"Error {resp.status_code}: {body_text.decode()[:300]}"
                     await queue.put(SENTINEL)
                     return
@@ -191,8 +265,8 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
                         now = time.perf_counter()
                         if now - last_progress > 0.3:
                             preview = state["full_text"][-80:] if len(state["full_text"]) > 80 else state["full_text"]
-                            # Fire and forget progress updates to avoid blocking the consumer loop
-                            asyncio.create_task(_send_progress(progress_token, 0.5, f"...{preview}"))
+                            # Beautiful concurrent streaming: prefix with model name
+                            asyncio.create_task(_send_progress(progress_token, 0.5, f"[{model}] {preview}"))
                             last_progress = now
             queue.task_done()
 
@@ -213,58 +287,162 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
 # ── Conversation management ─────────────────────────────────────────────────
 
 async def chat(client, user_message, progress_token=None, model_override=None, model_type_override=None):
-    """Send a message, get a response, maintain history."""
-    global _conversation_history
+    """Send a message, get a response, maintain history, use cache, and fallback on rate limits."""
+    global _cache, CURRENT_SESSION
+
+    # Load history from DB
+    history = get_history(CURRENT_SESSION)
 
     messages = []
     sys_prompt = CONFIG.get("system_prompt", "")
     if sys_prompt:
         messages.append({"role": "system", "content": sys_prompt})
-    messages.extend(_conversation_history)
+    messages.extend(history)
     messages.append({"role": "user", "content": user_message})
+
+    # Generate cache key
+    model_name = model_override if model_override else CONFIG.get("model", "")
+    cache_key = json.dumps({"messages": messages, "model": model_name}, sort_keys=True)
+
+    if cache_key in _cache:
+        cached_resp, usage, latency = _cache[cache_key]
+        if progress_token:
+            await _send_progress(progress_token, 1.0, "Cache hit!")
+        return f"{cached_resp} (cached)", usage, latency
 
     response, usage, latency = await call_llm(client, messages, progress_token, model_override, model_type_override)
 
-    if not response.startswith("Error"):
-        # For simplicity in multi-agent, we'll only append history in the main chat tool
-        # or we could let the single chat handle history and multi_chat just return results.
+    # Automatic Fallback Logic for Rate Limits (429)
+    if "Rate Limit hit" in response and not model_override:
+        fallback_model = "Meta-Llama-3.1-405B-Instruct"
+        if progress_token:
+            await _send_progress(progress_token, 0.2, f"Primary model resting. Summoning {fallback_model}...")
+        
+        fb_response, fb_usage, fb_latency = await call_llm(client, messages, progress_token, fallback_model, "serverless")
+        
+        if not fb_response.startswith("Error") and "Rate Limit hit" not in fb_response:
+            response = f"{fb_response}\n\n*(Note: {model_name} was busy; {fallback_model} stepped in to answer.)*"
+            usage = fb_usage
+            latency += fb_latency
+            model_name = fallback_model
+
+    if not response.startswith("Error") and "Rate Limit hit" not in response:
+        # Update cache on success
+        _cache[cache_key] = (response, usage, latency)
+        
         if not model_override:
-            _conversation_history.append({"role": "user", "content": user_message})
-            _conversation_history.append({"role": "assistant", "content": response})
-            max_turns = CONFIG.get("conversation_max_turns", 50)
-            while len(_conversation_history) > max_turns * 2:
-                _conversation_history.pop(0)
-                _conversation_history.pop(0)
+            # Save to DB
+            add_message(CURRENT_SESSION, "user", user_message)
+            add_message(CURRENT_SESSION, "assistant", response)
 
     return response, usage, latency
 
-async def multi_chat(client, user_message, models, progress_token=None):
-    """Dispatch message to multiple models concurrently."""
-    tasks = []
-    
+async def multi_chat(client, user_message, models=None, progress_token=None):
+    """Dispatch message to multiple models concurrently and return results as they arrive."""
+    global CURRENT_SESSION
+
+    # Fall back to configured defaults if no models specified
+    if not models:
+        models = CONFIG.get("default_models", DEFAULTS["default_models"])
+
+    n = len(models)
+    timeout = CONFIG.get("multi_chat_timeout", DEFAULTS["multi_chat_timeout"])
+    tasks = {}
+    t0 = time.perf_counter()
+
+    # Progress: smooth time-based ticker that always moves, with jumps on model completion.
+    # Creeps toward 90% proportional to elapsed/timeout, so the bar is always alive.
+    # Jumps +5% instantly when a model finishes. Final 90→100% on completion.
+    ticker_pct = 0
+    models_done = 0
+
+    async def _progress_ticker():
+        """Background task: advance progress bar every 300ms. Always moves forward."""
+        nonlocal ticker_pct
+        while ticker_pct < 99:
+            await asyncio.sleep(0.2)
+            elapsed = time.perf_counter() - t0
+            # Minimum +2% per tick so the bar never stalls
+            target = ticker_pct + 2
+            # Time-based creep toward 99%
+            time_pct = min(int((elapsed / timeout) * 99), 99)
+            target = max(target, time_pct)
+            # Completion-based jump
+            done_pct = int((models_done / n) * 99)
+            target = max(target, done_pct)
+            target = min(target, 99)
+            if target > ticker_pct:
+                ticker_pct = target
+                elapsed_ms = elapsed * 1000
+                await _send_progress(progress_token, ticker_pct / 100, f"⏳ {models_done}/{n} done ({elapsed_ms:.0f}ms)")
+
+    if progress_token:
+        await _send_progress(progress_token, 0.0, f"⏳ Querying {n} models...")
+        ticker_task = asyncio.create_task(_progress_ticker())
+    else:
+        ticker_task = None
+
+    def _on_model_done(fut):
+        nonlocal models_done, ticker_pct
+        models_done += 1
+        # Immediately jump progress bar when a model completes
+        if progress_token:
+            done_pct = int((models_done / n) * 99)
+            if done_pct > ticker_pct:
+                ticker_pct = done_pct
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                asyncio.create_task(_send_progress(progress_token, ticker_pct / 100, f"⚡ {models_done}/{n} done ({elapsed_ms:.0f}ms)"))
+
     for m in models:
-        # Determine type based on name heuristically for this test
         m_type = "deployed" if "gpt" in m.lower() else "serverless"
-        
-        # We wrap the call so we know which model it came from
+
         async def _call_model(model_name, model_type):
-            resp, usage, lat = await chat(client, user_message, progress_token, model_name, model_type)
+            resp, usage, lat = await chat(client, user_message, None, model_name, model_type)
             return model_name, resp, usage, lat
-            
-        tasks.append(asyncio.create_task(_call_model(m, m_type)))
-        
-    results = await asyncio.gather(*tasks)
-    
+
+        task = asyncio.create_task(_call_model(m, m_type))
+        task.add_done_callback(_on_model_done)
+        tasks[m] = task
+
+    # Wait for all tasks with per-model timeout
+    done, pending = await asyncio.wait(tasks.values(), timeout=timeout)
+
+    # Cancel stragglers
+    for task in pending:
+        task.cancel()
+
+    # Stop ticker
+    if ticker_task:
+        ticker_task.cancel()
+        try:
+            await ticker_task
+        except asyncio.CancelledError:
+            pass
+        # Bridge the gap: ticker may have been mid-sleep, catch up to 90%
+        await _send_progress(progress_token, 0.99, f"⏳ {len(done)}/{n} responded, collecting results...")
+
+    # Collect results in model list order
     final_output = ""
-    for name, resp, usage, lat in results:
-        # Strip system messages or verbose tags from the output for a cleaner look
-        final_output += f"**[{name}]**\n{resp}\n\n"
-        
-    # Append the combined request/response to history once
-    global _conversation_history
-    _conversation_history.append({"role": "user", "content": user_message})
-    _conversation_history.append({"role": "assistant", "content": final_output.strip()})
-    
+    for m in models:
+        task = tasks[m]
+        if task in done:
+            try:
+                name, resp, usage, lat = task.result()
+                final_output += f"**[{name}]** ({lat:.0f}ms)\n{resp}\n\n"
+            except Exception as e:
+                final_output += f"**[{m}]** (error)\n{e}\n\n"
+        else:
+            final_output += f"**[{m}]** (timed out after {timeout}s)\n_Skipped — exceeded {timeout}s timeout_\n\n"
+
+    wall_time = (time.perf_counter() - t0) * 1000
+    final_output += f"_Wall time: {wall_time:.0f}ms across {n} models ({len(done)} responded, {len(pending)} timed out)_"
+
+    if progress_token:
+        await _send_progress(progress_token, 1.0, f"✅ Complete — {len(done)} responded, {len(pending)} timed out")
+
+    # Don't save multi_chat to session history — it pollutes individual model contexts
+    # with other models' responses, causing echo/repetition on subsequent calls.
+
     return final_output.strip()
 
 # ── MCP protocol ────────────────────────────────────────────────────────────
@@ -283,7 +461,16 @@ TOOLS = [
     },
     {
         "name": "multi_chat",
-        "description": "Send a message to multiple models concurrently and get a combined response.",
+        "description": (
+            "Send a message to multiple models concurrently and get a combined response. "
+            "If models is omitted, uses the configured default_models list. "
+            "Each response includes per-model latency and a wall-time summary. "
+            "Slow models are skipped after the configured timeout (default 15s). "
+            "VOICE FLOW: To read responses aloud, pass the output to multi_speak with these voice assignments: "
+            "gpt-5.3-chat→en-US-DavisNeural, Meta-Llama-3.1-405B-Instruct→en-US-AndrewNeural, "
+            "DeepSeek-R1→en-US-BrianNeural, Phi-4→en-US-JennyNeural. "
+            "Claude (the caller) uses en-US-AvaNeural."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -291,10 +478,10 @@ TOOLS = [
                 "models": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List of model names to query (e.g., ['gpt-5.3-chat', 'grok-3'])."
+                    "description": "List of model names to query. Optional — defaults to configured default_models."
                 }
             },
-            "required": ["message", "models"],
+            "required": ["message"],
         },
     },
     {
@@ -313,12 +500,69 @@ TOOLS = [
                 "system_prompt": {"type": "string"},
                 "conversation_max_turns": {"type": "integer"},
                 "voice": {"type": "string"},
+                "default_models": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Default model list for multi_chat when models param is omitted."
+                },
+                "multi_chat_timeout": {
+                    "type": "integer",
+                    "description": "Per-model timeout in seconds for multi_chat (default 15)."
+                },
             },
         },
     },
     {
         "name": "reset",
-        "description": "Clear conversation history and start fresh.",
+        "description": "Clear conversation history for the current session.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "list_sessions",
+        "description": "List all available chat sessions.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "create_session",
+        "description": "Create a new named chat session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Name of the new session."}
+            },
+            "required": ["name"]
+        },
+    },
+    {
+        "name": "switch_session",
+        "description": "Switch to a different chat session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Name of the session to switch to."}
+            },
+            "required": ["name"]
+        },
+    },
+    {
+        "name": "delete_session",
+        "description": "Delete a chat session and its history.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Name of the session to delete."}
+            },
+            "required": ["name"]
+        },
+    },
+    {
+        "name": "clear_cache",
+        "description": "Clear the in-memory response cache.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "status",
+        "description": "Show the current status and availability of models.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -346,7 +590,7 @@ async def handle_request(client, req):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": True}},
-                "serverInfo": {"name": "azure-voice-assistant", "version": "1.1.0-async"},
+                "serverInfo": {"name": "azure-voice-assistant", "version": "1.2.0-async"},
             },
         })
     elif method == "notifications/initialized":
@@ -369,7 +613,7 @@ async def _run_tool(client, req_id, tool_name, args, progress_token):
 
     elif tool_name == "multi_chat":
         message = args.get("message", "")
-        models = args.get("models", ["gpt-5.3-chat", "grok-3"])
+        models = args.get("models")  # None = use configured defaults
         if not message:
             await _write_response(_result(req_id, "Error: 'message' is required."))
             return
@@ -382,10 +626,83 @@ async def _run_tool(client, req_id, tool_name, args, progress_token):
         await _write_response(_result(req_id, res))
 
     elif tool_name == "reset":
-        global _conversation_history
-        count = len(_conversation_history) // 2
-        _conversation_history = []
-        await _write_response(_result(req_id, f"Conversation cleared ({count} turns removed)."))
+        global CURRENT_SESSION
+        clear_session(CURRENT_SESSION)
+        await _write_response(_result(req_id, f"History for session '{CURRENT_SESSION}' has been cleared."))
+
+    elif tool_name == "list_sessions":
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.execute("SELECT name FROM sessions ORDER BY name ASC")
+                sessions = [r[0] for r in cursor.fetchall()]
+                res = "**[Available Sessions]**\n" + "\n".join([f"* {s} {'(current)' if s == CURRENT_SESSION else ''}" for s in sessions])
+                await _write_response(_result(req_id, res))
+        except Exception as e:
+            await _write_response(_result(req_id, f"Error listing sessions: {e}"))
+
+    elif tool_name == "create_session":
+        name = args.get("name", "").strip()
+        if not name:
+            await _write_response(_result(req_id, "Error: 'name' is required."))
+            return
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("INSERT INTO sessions (name) VALUES (?)", (name,))
+                await _write_response(_result(req_id, f"Session '{name}' created."))
+        except sqlite3.IntegrityError:
+            await _write_response(_result(req_id, f"Error: Session '{name}' already exists."))
+        except Exception as e:
+            await _write_response(_result(req_id, f"Error creating session: {e}"))
+
+    elif tool_name == "switch_session":
+        name = args.get("name", "").strip()
+        if not name:
+            await _write_response(_result(req_id, "Error: 'name' is required."))
+            return
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.execute("SELECT 1 FROM sessions WHERE name = ?", (name,))
+                if cursor.fetchone():
+                    CURRENT_SESSION = name
+                    await _write_response(_result(req_id, f"Switched to session '{name}'."))
+                else:
+                    await _write_response(_result(req_id, f"Error: Session '{name}' does not exist."))
+        except Exception as e:
+            await _write_response(_result(req_id, f"Error switching session: {e}"))
+
+    elif tool_name == "delete_session":
+        name = args.get("name", "").strip()
+        if not name:
+            await _write_response(_result(req_id, "Error: 'name' is required."))
+            return
+        if name == "default":
+            await _write_response(_result(req_id, "Error: Cannot delete the 'default' session."))
+            return
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute("DELETE FROM sessions WHERE name = ?", (name,))
+                if CURRENT_SESSION == name:
+                    CURRENT_SESSION = "default"
+                await _write_response(_result(req_id, f"Session '{name}' and its history deleted."))
+        except Exception as e:
+            await _write_response(_result(req_id, f"Error deleting session: {e}"))
+
+    elif tool_name == "clear_cache":
+        global _cache
+        count = len(_cache)
+        _cache = {}
+        await _write_response(_result(req_id, f"Cache cleared ({count} items removed)."))
+
+    elif tool_name == "status":
+        global _model_status
+        if not _model_status:
+            await _write_response(_result(req_id, "All models are currently in standby (no recent calls)."))
+        else:
+            lines = ["**[Model Status]**"]
+            for m, s in _model_status.items():
+                lines.append(f"* {m}: {s}")
+            await _write_response(_result(req_id, "\n".join(lines)))
 
     elif tool_name == "models":
         res = await _handle_models(client, args, progress_token)
@@ -409,7 +726,7 @@ def _handle_configure(args):
     settable = {
         "api_key", "endpoint", "deployment", "model", "model_type",
         "max_completion_tokens", "temperature", "system_prompt",
-        "conversation_max_turns", "voice",
+        "conversation_max_turns", "voice", "default_models", "multi_chat_timeout",
     }
     updated = []
     for k, v in args.items():
@@ -420,6 +737,8 @@ def _handle_configure(args):
         elif k == "max_completion_tokens": CONFIG[k] = max(1, min(int(v), 128000))
         elif k == "temperature": CONFIG[k] = max(0.0, min(float(v), 2.0))
         elif k == "conversation_max_turns": CONFIG[k] = max(1, min(int(v), 500))
+        elif k == "default_models": CONFIG[k] = list(v) if isinstance(v, list) else [str(v)]
+        elif k == "multi_chat_timeout": CONFIG[k] = max(1, min(int(v), 120))
         else: CONFIG[k] = v
         updated.append(f"{k}={CONFIG[k]}" if k != "api_key" else f"{k}=***{str(v)[-4:]}")
 
@@ -440,6 +759,11 @@ def _handle_configure(args):
     lines.append("")
     lines.append("[Conversation]")
     lines.append(f"  turns:       {len(_conversation_history) // 2} / {CONFIG.get('conversation_max_turns', '')}")
+    lines.append("")
+    lines.append("[Multi-Chat]")
+    dm = CONFIG.get("default_models", DEFAULTS["default_models"])
+    lines.append(f"  defaults:    {', '.join(dm)}")
+    lines.append(f"  timeout:     {CONFIG.get('multi_chat_timeout', DEFAULTS['multi_chat_timeout'])}s")
     return "\n".join(lines)
 
 
@@ -494,9 +818,10 @@ async def _test_model(client, name, mtype):
 # ── MCP transport ───────────────────────────────────────────────────────────
 
 async def _send_progress(token, progress, message=""):
+    """Send MCP progress notification. Progress is 0.0-1.0 float, sent as 0-100 integer."""
     await _write_response({
         "jsonrpc": "2.0", "method": "notifications/progress",
-        "params": {"progressToken": token, "progress": progress, "total": 1.0, "message": message},
+        "params": {"progressToken": token, "progress": int(progress * 100), "total": 100, "message": message},
     })
 
 
@@ -512,7 +837,15 @@ async def main():
     protocol = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: protocol, sys.stdin)
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
+    # Enhanced Connection Pooling: tune limits for high-concurrency multi-agent calls
+    limits = httpx.Limits(
+        max_connections=100,          # Allow up to 100 concurrent connections
+        max_keepalive_connections=20, # Keep up to 20 connections alive for reuse
+        keepalive_expiry=30.0         # Connections expire after 30s of inactivity
+    )
+    timeout = httpx.Timeout(60.0, connect=10.0)
+
+    async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
         while True:
             line = await reader.readline()
             if not line: break
