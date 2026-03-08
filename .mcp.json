@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "azure-voice-assistant": {
+    "azure-chat-assistant": {
       "command": "python3",
-      "args": ["/home/jp/Projects/azure-voice-assistant/mcp_voice_assistant.py"]
+      "args": ["/home/jp/Projects/azure-chat-assistant/mcp_voice_assistant.py"]
     }
   }
 }
