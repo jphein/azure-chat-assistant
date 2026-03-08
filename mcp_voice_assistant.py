@@ -16,6 +16,7 @@ Tools:
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -286,12 +287,12 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
 
 # ── Conversation management ─────────────────────────────────────────────────
 
-async def chat(client, user_message, progress_token=None, model_override=None, model_type_override=None):
+async def chat(client, user_message, progress_token=None, model_override=None, model_type_override=None, cached_history=None):
     """Send a message, get a response, maintain history, use cache, and fallback on rate limits."""
     global _cache, CURRENT_SESSION
 
-    # Load history from DB
-    history = get_history(CURRENT_SESSION)
+    # Load history from DB (or use cached if provided by multi_chat)
+    history = cached_history if cached_history is not None else get_history(CURRENT_SESSION)
 
     messages = []
     sys_prompt = CONFIG.get("system_prompt", "")
@@ -300,9 +301,10 @@ async def chat(client, user_message, progress_token=None, model_override=None, m
     messages.extend(history)
     messages.append({"role": "user", "content": user_message})
 
-    # Generate cache key
+    # Generate cache key using hash (avoids serializing entire history)
     model_name = model_override if model_override else CONFIG.get("model", "")
-    cache_key = json.dumps({"messages": messages, "model": model_name}, sort_keys=True)
+    msg_hash = hashlib.md5(json.dumps(messages, separators=(',', ':')).encode()).hexdigest()
+    cache_key = f"{model_name}:{msg_hash}"
 
     if cache_key in _cache:
         cached_resp, usage, latency = _cache[cache_key]
@@ -382,6 +384,9 @@ async def multi_chat(client, user_message, models=None, progress_token=None):
     else:
         ticker_task = None
 
+    # Load history once for all models (avoids N redundant DB reads)
+    history = get_history(CURRENT_SESSION)
+
     def _on_model_done(fut):
         nonlocal models_done, ticker_pct
         models_done += 1
@@ -397,7 +402,7 @@ async def multi_chat(client, user_message, models=None, progress_token=None):
         m_type = "deployed" if "gpt" in m.lower() else "serverless"
 
         async def _call_model(model_name, model_type):
-            resp, usage, lat = await chat(client, user_message, None, model_name, model_type)
+            resp, usage, lat = await chat(client, user_message, None, model_name, model_type, cached_history=history)
             return model_name, resp, usage, lat
 
         task = asyncio.create_task(_call_model(m, m_type))
