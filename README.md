@@ -23,35 +23,53 @@ Exposes Azure AI models as MCP tools so AI CLI agents (Claude Code, Gemini CLI, 
 
 - Python 3.8+
 - An Azure AI Foundry resource with API key
-- `httpx` (`pip install httpx`)
+
+### Install
+
+```bash
+git clone https://github.com/jphein/azure-chat-assistant.git
+cd azure-chat-assistant
+python3 -m venv venv
+./venv/bin/pip install httpx
+```
 
 ### Configure
 
-Create `~/.config/azure-chat-assistant/config.json`:
+The server auto-creates its config directory on first run. To set your API key:
 
-```json
+```bash
+mkdir -p ~/.config/azure-chat-assistant
+cat > ~/.config/azure-chat-assistant/config.json << 'EOF'
 {
     "api_key": "your-azure-ai-key",
     "endpoint": "https://your-resource.services.ai.azure.com",
     "deployment": "gpt-5.3-chat",
     "model_type": "deployed"
 }
+EOF
+```
+
+Or configure at runtime via the `configure` tool:
+```
+configure(api_key="your-azure-ai-key")
 ```
 
 ### Register with your CLI agent
 
-**Claude Code** — add to your project or global `.claude.json`:
+**Claude Code** — add to your global `~/.claude.json`:
 
 ```json
 {
   "mcpServers": {
     "azure-chat-assistant": {
-      "command": "python3",
+      "command": "/path/to/azure-chat-assistant/venv/bin/python3",
       "args": ["/path/to/azure-chat-assistant/mcp_chat_assistant.py"]
     }
   }
 }
 ```
+
+> **Note**: Use the venv python, not system python, so `httpx` is available.
 
 **Gemini CLI** — add to `~/.gemini/settings.json` under `mcpServers`.
 

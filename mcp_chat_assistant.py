@@ -851,19 +851,21 @@ async def main():
     timeout = httpx.Timeout(60.0, connect=10.0)
 
     async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
-        # Pre-warm TLS connection to Azure on startup (saves ~200ms on first call)
-        api_key = CONFIG.get("api_key", "")
-        endpoint = CONFIG.get("endpoint", "")
-        if api_key and endpoint:
-            try:
-                await client.post(
-                    f"{endpoint}/openai/deployments/{CONFIG.get('deployment', '')}/chat/completions?api-version=2024-10-21",
-                    json={"messages": [{"role": "user", "content": "warmup"}], "max_completion_tokens": 1},
-                    headers={"api-key": api_key},
-                    timeout=10.0,
-                )
-            except Exception:
-                pass  # Best-effort warmup, don't block startup
+        # Pre-warm TLS connection to Azure in background (don't block MCP handshake)
+        async def _warmup():
+            api_key = CONFIG.get("api_key", "")
+            endpoint = CONFIG.get("endpoint", "")
+            if api_key and endpoint:
+                try:
+                    await client.post(
+                        f"{endpoint}/openai/deployments/{CONFIG.get('deployment', '')}/chat/completions?api-version=2024-10-21",
+                        json={"messages": [{"role": "user", "content": "warmup"}], "max_completion_tokens": 1},
+                        headers={"api-key": api_key},
+                        timeout=10.0,
+                    )
+                except Exception:
+                    pass
+        asyncio.create_task(_warmup())
 
         while True:
             line = await reader.readline()
