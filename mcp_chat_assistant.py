@@ -43,7 +43,8 @@ DEFAULTS = {
     "default_models": ["gpt-5.3-chat", "Meta-Llama-3.1-405B-Instruct", "Phi-4"],  # models for multi_chat when none specified
     "multi_chat_timeout": 15,        # per-model timeout in seconds for multi_chat
     "google_api_key": "",
-    "google_endpoint": "https://aiplatform.googleapis.com/v1beta1/projects/247492937484/locations/global/endpoints/openapi",
+    "google_project": "",
+    "google_region": "global",
 }
 
 CONFIG = {}
@@ -134,13 +135,23 @@ def save_config():
         if k in DEFAULTS and CONFIG[k] == DEFAULTS[k]:
             continue
         disk[k] = v
-    for k in ("api_key", "endpoint", "deployment", "model", "model_type", "google_api_key", "google_endpoint"):
+    for k in ("api_key", "endpoint", "deployment", "model", "model_type", "google_api_key", "google_project", "google_region"):
         disk[k] = CONFIG[k]
     with open(CONFIG_PATH, "w") as f:
         json.dump(disk, f, indent=4)
 
 
 CONFIG = load_config()
+
+
+def _google_base_url():
+    """Build Vertex AI OpenAI-compatible base URL from project + region config."""
+    project = CONFIG.get("google_project", "")
+    region = CONFIG.get("google_region", "global")
+    if not project:
+        return ""
+    return f"https://aiplatform.googleapis.com/v1beta1/projects/{project}/locations/{region}/endpoints/openapi"
+
 
 # ── LLM call ────────────────────────────────────────────────────────────────
 
@@ -160,7 +171,9 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
         google_key = CONFIG.get("google_api_key", "")
         if not google_key:
             return "Error: No Google API key configured. Use configure tool to set google_api_key.", {}, 0
-        google_ep = CONFIG.get("google_endpoint", DEFAULTS["google_endpoint"])
+        google_ep = _google_base_url()
+        if not google_ep:
+            return "Error: No Google project configured. Use configure tool to set google_project.", {}, 0
         url = f"{google_ep}/chat/completions"
         body = {
             "messages": messages,
@@ -539,8 +552,9 @@ TOOLS = [
                     "type": "integer",
                     "description": "Per-model timeout in seconds for multi_chat (default 15)."
                 },
-                "google_api_key": {"type": "string", "description": "Google AI API key for Gemini models."},
-                "google_endpoint": {"type": "string", "description": "Google AI endpoint URL."},
+                "google_api_key": {"type": "string", "description": "Google Vertex AI API key for Gemini models."},
+                "google_project": {"type": "string", "description": "Google Cloud project ID or number."},
+                "google_region": {"type": "string", "description": "Vertex AI region (default: global)."},
             },
         },
     },
@@ -759,14 +773,14 @@ def _handle_configure(args):
         "api_key", "endpoint", "deployment", "model", "model_type",
         "max_completion_tokens", "temperature", "system_prompt",
         "conversation_max_turns", "voice", "default_models", "multi_chat_timeout",
-        "google_api_key", "google_endpoint",
+        "google_api_key", "google_project", "google_region",
     }
     updated = []
     for k, v in args.items():
         if k not in settable: continue
         if k in ("api_key", "google_api_key"): CONFIG[k] = str(v)
-        elif k in ("endpoint", "google_endpoint"): CONFIG[k] = str(v).rstrip("/")
-        elif k in ("deployment", "model", "model_type", "system_prompt", "voice"): CONFIG[k] = str(v)
+        elif k == "endpoint": CONFIG[k] = str(v).rstrip("/")
+        elif k in ("deployment", "model", "model_type", "system_prompt", "voice", "google_project", "google_region"): CONFIG[k] = str(v)
         elif k == "max_completion_tokens": CONFIG[k] = max(1, min(int(v), 128000))
         elif k == "temperature": CONFIG[k] = max(0.0, min(float(v), 2.0))
         elif k == "conversation_max_turns": CONFIG[k] = max(1, min(int(v), 500))
@@ -798,10 +812,13 @@ def _handle_configure(args):
     lines.append(f"  defaults:    {', '.join(dm)}")
     lines.append(f"  timeout:     {CONFIG.get('multi_chat_timeout', DEFAULTS['multi_chat_timeout'])}s")
     lines.append("")
-    lines.append("[Google AI]")
+    lines.append("[Google Vertex AI]")
     gkey = CONFIG.get("google_api_key", "")
     lines.append(f"  api_key:     ***{gkey[-4:]}" if gkey else "  api_key:     (not set)")
-    lines.append(f"  endpoint:    {CONFIG.get('google_endpoint', DEFAULTS['google_endpoint'])}")
+    lines.append(f"  project:     {CONFIG.get('google_project', '') or '(not set)'}")
+    lines.append(f"  region:      {CONFIG.get('google_region', 'global')}")
+    gurl = _google_base_url()
+    lines.append(f"  endpoint:    {gurl or '(set google_project to enable)'}")
     return "\n".join(lines)
 
 
@@ -847,7 +864,7 @@ async def _handle_models(client, args, progress_token):
 async def _test_model(client, name, mtype):
     try:
         if mtype == "google":
-            google_ep = CONFIG.get("google_endpoint", DEFAULTS["google_endpoint"])
+            google_ep = _google_base_url()
             url = f"{google_ep}/chat/completions"
             body = {"messages": [{"role": "user", "content": "hi"}], "model": f"google/{name}", "max_tokens": 10}
             headers = {"x-goog-api-key": CONFIG.get("google_api_key", ""), "Content-Type": "application/json"}
