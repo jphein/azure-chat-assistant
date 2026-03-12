@@ -11,9 +11,11 @@ Refactored for asyncio and httpx for maximum efficiency and concurrency.
 Tools:
   - chat:      Send a message to the LLM, get a response (with conversation history)
   - configure: View/change settings dynamically (model, API key, region, etc.)
-  - reset:     Clear conversation history
+  - reset:       Clear conversation history
+  - clear_cache: Clear the in-memory response cache
   - models:    List available models and test connectivity
-"""
+  """
+
 
 import asyncio
 import hashlib
@@ -181,6 +183,14 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
     max_tokens = CONFIG.get("max_completion_tokens", 2048)
     temperature = CONFIG.get("temperature", 1.0)
 
+    # Reasoning models (o1, o3, o4) use "developer" role instead of "system"
+    is_reasoning = any(deployment.startswith(p) or model.startswith(p) for p in ("o1", "o3", "o4"))
+    if is_reasoning:
+        messages = [
+            {"role": "developer" if m["role"] == "system" else m["role"], "content": m["content"]}
+            for m in messages
+        ]
+
     if model_type == "google":
         google_key = CONFIG.get("google_api_key", "")
         if not google_key:
@@ -221,7 +231,10 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
             return "Error: No API key configured. Use configure tool to set api_key.", {}, 0
         if not endpoint:
             return "Error: No endpoint configured.", {}, 0
-        url = f"{endpoint}/models/chat/completions?api-version=2024-05-01-preview"
+        
+        # o1 and o4 models on serverless endpoints require a newer api-version
+        version = "2024-12-01-preview" if any(p in model.lower() for p in ("o1", "o4")) else "2024-05-01-preview"
+        url = f"{endpoint}/models/chat/completions?api-version={version}"
         body = {
             "messages": messages,
             "model": model,
@@ -234,14 +247,40 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
             "Content-Type": "application/json",
         }
 
-    if temperature != 1.0:
+    if is_reasoning:
+        body["reasoning_effort"] = CONFIG.get("reasoning_effort", "high")
+        body["max_completion_tokens"] = body.pop("max_tokens", body.get("max_completion_tokens", max_tokens))
+        body.pop("stream", None)
+        body.pop("stream_options", None)
+    elif temperature != 1.0:
         body["temperature"] = temperature
 
     if progress_token:
         await _send_progress(progress_token, 0.1, f"[{model}] Thinking...")
 
     t0 = time.perf_counter()
-    
+
+    # Non-streaming path for reasoning models (o1, o3)
+    if is_reasoning:
+        try:
+            resp = await client.post(url, json=body, headers=headers, timeout=120.0)
+            latency = (time.perf_counter() - t0) * 1000
+            if resp.status_code == 429:
+                _model_status[model] = "Rate Limited"
+                return f"**[{model}]** is currently resting (Rate Limit hit).", {}, 0
+            if resp.status_code != 200:
+                _model_status[model] = f"Error {resp.status_code}"
+                return f"Error {resp.status_code}: {resp.text[:500]}", {}, latency
+            data = resp.json()
+            _model_status[model] = "OK"
+            text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            usage = data.get("usage", {})
+            if progress_token:
+                await _send_progress(progress_token, 1.0, f"[{model}] Done ({latency:.0f}ms)")
+            return text if text else "Error: No response from model.", usage, latency
+        except Exception as e:
+            return f"Error: {e}", {}, 0
+
     queue = asyncio.Queue(maxsize=100)
     SENTINEL = object()
     
@@ -452,7 +491,7 @@ async def multi_chat(client, user_message, models=None, progress_token=None):
                 asyncio.create_task(_send_progress(progress_token, ticker_pct / 100, f"⚡ {models_done}/{n} done ({elapsed_ms:.0f}ms)"))
 
     for m in models:
-        m_type = "google" if "gemini" in m.lower() else "deployed" if "gpt" in m.lower() or "o1" in m.lower() or "o3" in m.lower() else "serverless"
+        m_type = "google" if "gemini" in m.lower() else "deployed" if any(p in m.lower() for p in ("gpt", "o1", "o3", "o4")) else "serverless"
 
         async def _call_model(model_name, model_type):
             resp, usage, lat = await chat(client, user_message, None, model_name, model_type, cached_history=history)
@@ -579,8 +618,13 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
-        "name": "list_sessions",
-        "description": "List all available chat sessions.",
+        "name": "clear_cache",
+        "description": "Clear the in-memory response cache.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "status",
+        "description": "Show the current status and availability of models.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -691,6 +735,12 @@ async def _run_tool(client, req_id, tool_name, args, progress_token):
         clear_session(CURRENT_SESSION)
         await _write_response(_result(req_id, f"History for session '{CURRENT_SESSION}' has been cleared."))
 
+    elif tool_name == "clear_cache":
+        global _cache
+        count = len(_cache)
+        _cache.clear()
+        await _write_response(_result(req_id, f"In-memory response cache cleared ({count} items removed)."))
+
     elif tool_name == "list_sessions":
         try:
             with sqlite3.connect(DB_PATH) as conn:
@@ -748,12 +798,6 @@ async def _run_tool(client, req_id, tool_name, args, progress_token):
                 await _write_response(_result(req_id, f"Session '{name}' and its history deleted."))
         except Exception as e:
             await _write_response(_result(req_id, f"Error deleting session: {e}"))
-
-    elif tool_name == "clear_cache":
-        global _cache
-        count = len(_cache)
-        _cache = {}
-        await _write_response(_result(req_id, f"Cache cleared ({count} items removed)."))
 
     elif tool_name == "status":
         global _model_status

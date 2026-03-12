@@ -69,6 +69,14 @@ multi_speak(segments=[
 - `WISDOM_SCROLL.md` — Refactoring history and council recommendations
 - `RESEARCH_AND_PLAN.md` — Performance optimization roadmap
 
+## Reasoning Model Support (o1, o3, o4)
+Reasoning models need special handling (line 186-264):
+- Use `"developer"` role instead of `"system"` for system prompts
+- Use `max_completion_tokens` instead of `max_tokens` in request body
+- Non-streaming only (no SSE) — uses synchronous POST with 120s timeout
+- `reasoning_effort` configurable (default "high")
+- Deployed path (line 221) already uses `max_completion_tokens`; serverless/Google paths use `max_tokens` which gets swapped at line 252
+
 ## Known Issues
 - GPT-5.3 rejects `temperature` != 1.0 — the code only sends temperature when it differs from 1.0
 - DeepSeek R1 includes `<think>` tags regardless of system prompt
