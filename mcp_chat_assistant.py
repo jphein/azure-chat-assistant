@@ -19,11 +19,14 @@ Tools:
 
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import sys
 import time
 import sqlite3
+from datetime import datetime, timezone
+from urllib.parse import quote
 import httpx
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -47,6 +50,35 @@ DEFAULTS = {
     "google_api_key": "",
     "google_project": "",
     "google_region": "global",
+    # AWS Bedrock
+    "aws_access_key": "",
+    "aws_secret_key": "",
+    "aws_region": "us-east-1",
+}
+
+# ── Model Catalogs ──────────────────────────────────────────────────────────
+
+# AWS Bedrock model IDs (cross-region inference profiles)
+BEDROCK_MODELS = {
+    # Anthropic Claude 4.x
+    "claude-opus-4.5": "us.anthropic.claude-opus-4-5-20251101-v1:0",
+    "claude-opus-4.6": "us.anthropic.claude-opus-4-6-v1",
+    "claude-sonnet-4": "us.anthropic.claude-sonnet-4-20250514-v1:0",
+    "claude-sonnet-4.5": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "claude-sonnet-4.6": "us.anthropic.claude-sonnet-4-6",
+    "claude-haiku-4.5": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    # Amazon Nova
+    "nova-pro": "us.amazon.nova-pro-v1:0",
+    "nova-lite": "us.amazon.nova-lite-v1:0",
+    "nova-2-lite": "us.amazon.nova-2-lite-v1:0",
+    # Meta Llama 4
+    "llama4-maverick-17b": "us.meta.llama4-maverick-17b-instruct-v1:0",
+    "llama4-scout-17b": "us.meta.llama4-scout-17b-instruct-v1:0",
+    # Writer
+    "palmyra-x4": "us.writer.palmyra-x4-v1:0",
+    "palmyra-x5": "us.writer.palmyra-x5-v1:0",
+    # TwelveLabs
+    "pegasus-1.2": "us.twelvelabs.pegasus-1-2-v1:0",
 }
 
 CONFIG = {}
@@ -118,6 +150,9 @@ ENV_MAP = {
     "google_api_key": "GOOGLE_API_KEY",
     "google_project": "GOOGLE_PROJECT",
     "google_region":  "GOOGLE_REGION",
+    "aws_access_key": "AWS_ACCESS_KEY_ID",
+    "aws_secret_key": "AWS_SECRET_ACCESS_KEY",
+    "aws_region":     "AWS_DEFAULT_REGION",
 }
 
 
@@ -151,8 +186,8 @@ def save_config():
         if k in DEFAULTS and CONFIG[k] == DEFAULTS[k]:
             continue
         disk[k] = v
-    for k in ("api_key", "endpoint", "deployment", "model", "model_type", "google_api_key", "google_project", "google_region"):
-        disk[k] = CONFIG[k]
+    for k in ("api_key", "endpoint", "deployment", "model", "model_type", "google_api_key", "google_project", "google_region", "aws_access_key", "aws_secret_key", "aws_region"):
+        disk[k] = CONFIG.get(k, "")
     with open(CONFIG_PATH, "w") as f:
         json.dump(disk, f, indent=4)
 
@@ -169,6 +204,115 @@ def _google_base_url():
     return f"https://aiplatform.googleapis.com/v1beta1/projects/{project}/locations/{region}/endpoints/openapi"
 
 
+# ── AWS SigV4 Signing ───────────────────────────────────────────────────────
+
+def _aws_sign(method, url, headers, payload, region, service="bedrock"):
+    """Sign an AWS request using Signature Version 4."""
+    access_key = CONFIG.get("aws_access_key", "")
+    secret_key = CONFIG.get("aws_secret_key", "")
+    if not access_key or not secret_key:
+        return headers
+
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    host = parsed.netloc
+    uri = parsed.path or "/"
+
+    t = datetime.now(timezone.utc)
+    amz_date = t.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = t.strftime("%Y%m%d")
+
+    canonical_uri = quote(uri, safe="/-_.~")
+    headers_to_sign = {"host": host, "x-amz-date": amz_date, "content-type": "application/json"}
+    signed_headers = ";".join(sorted(headers_to_sign.keys()))
+    canonical_headers = "".join(f"{k}:{v}\n" for k, v in sorted(headers_to_sign.items()))
+    payload_hash = hashlib.sha256(payload.encode() if isinstance(payload, str) else payload).hexdigest()
+
+    canonical_request = f"{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+
+    algorithm = "AWS4-HMAC-SHA256"
+    credential_scope = f"{date_stamp}/{region}/{service}/aws4_request"
+    string_to_sign = f"{algorithm}\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode()).hexdigest()}"
+
+    def sign(key, msg):
+        return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+
+    k_date = sign(f"AWS4{secret_key}".encode(), date_stamp)
+    k_region = sign(k_date, region)
+    k_service = sign(k_region, service)
+    k_signing = sign(k_service, "aws4_request")
+    signature = hmac.new(k_signing, string_to_sign.encode(), hashlib.sha256).hexdigest()
+
+    authorization = f"{algorithm} Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
+
+    return {**headers, "host": host, "x-amz-date": amz_date, "authorization": authorization, "content-type": "application/json"}
+
+
+def _get_bedrock_model_id(model_name):
+    """Convert friendly model name to Bedrock model ID."""
+    if model_name in BEDROCK_MODELS:
+        return BEDROCK_MODELS[model_name]
+    if "." in model_name or ":" in model_name:
+        return model_name
+    return None
+
+
+async def call_bedrock(client: httpx.AsyncClient, messages, progress_token=None, model_name="claude-opus-4.5"):
+    """Call AWS Bedrock using the Converse API. Returns (response_text, usage_dict, latency_ms)."""
+    region = CONFIG.get("aws_region", "us-east-1")
+    model_id = _get_bedrock_model_id(model_name)
+
+    if not model_id:
+        return f"Error: Unknown Bedrock model '{model_name}'", {}, 0
+    if not CONFIG.get("aws_access_key") or not CONFIG.get("aws_secret_key"):
+        return "Error: AWS credentials not configured. Set aws_access_key and aws_secret_key.", {}, 0
+
+    system_content = []
+    converse_messages = []
+    for msg in messages:
+        if msg["role"] == "system":
+            system_content.append({"text": msg["content"]})
+        else:
+            converse_messages.append({"role": msg["role"], "content": [{"text": msg["content"]}]})
+
+    body = {
+        "modelId": model_id,
+        "messages": converse_messages,
+        "inferenceConfig": {"maxTokens": CONFIG.get("max_completion_tokens", 2048), "temperature": CONFIG.get("temperature", 1.0)}
+    }
+    if system_content:
+        body["system"] = system_content
+
+    url = f"https://bedrock-runtime.{region}.amazonaws.com/model/{quote(model_id, safe='')}/converse"
+    payload = json.dumps(body)
+    headers = _aws_sign("POST", url, {}, payload, region, "bedrock")
+
+    if progress_token:
+        await _send_progress(progress_token, 0.1, f"[{model_name}] Thinking...")
+
+    t0 = time.perf_counter()
+    try:
+        resp = await client.post(url, content=payload, headers=headers, timeout=60.0)
+        latency = (time.perf_counter() - t0) * 1000
+
+        if resp.status_code == 200:
+            _model_status[model_name] = "OK"
+            data = resp.json()
+            response_text = ""
+            for block in data.get("output", {}).get("message", {}).get("content", []):
+                if "text" in block:
+                    response_text += block["text"]
+            return response_text, data.get("usage", {}), latency
+        elif resp.status_code == 429:
+            _model_status[model_name] = "Rate Limited"
+            return f"**[{model_name}]** Rate limit hit.", {}, 0
+        else:
+            _model_status[model_name] = f"Error {resp.status_code}"
+            return f"Error {resp.status_code}: {resp.text[:300]}", {}, 0
+    except Exception as e:
+        return f"Error: {e}", {}, 0
+
+
 # ── LLM call ────────────────────────────────────────────────────────────────
 
 async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, model_override=None, model_type_override=None):
@@ -182,6 +326,10 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
 
     max_tokens = CONFIG.get("max_completion_tokens", 2048)
     temperature = CONFIG.get("temperature", 1.0)
+
+    # Route to Bedrock if model type is bedrock
+    if model_type == "bedrock":
+        return await call_bedrock(client, messages, progress_token, model)
 
     # Reasoning models (o1, o3, o4) use "developer" role instead of "system"
     is_reasoning = any(deployment.startswith(p) or model.startswith(p) for p in ("o1", "o3", "o4"))
@@ -490,8 +638,18 @@ async def multi_chat(client, user_message, models=None, progress_token=None):
                 elapsed_ms = (time.perf_counter() - t0) * 1000
                 asyncio.create_task(_send_progress(progress_token, ticker_pct / 100, f"⚡ {models_done}/{n} done ({elapsed_ms:.0f}ms)"))
 
+    def _detect_model_type(model_name):
+        ml = model_name.lower()
+        if "gemini" in ml:
+            return "google"
+        if model_name in BEDROCK_MODELS or "claude" in ml or "anthropic" in ml or "nova" in ml or "llama4" in ml:
+            return "bedrock"
+        if any(p in ml for p in ("gpt", "o1", "o3", "o4")):
+            return "deployed"
+        return "serverless"
+
     for m in models:
-        m_type = "google" if "gemini" in m.lower() else "deployed" if any(p in m.lower() for p in ("gpt", "o1", "o3", "o4")) else "serverless"
+        m_type = _detect_model_type(m)
 
         async def _call_model(model_name, model_type):
             resp, usage, lat = await chat(client, user_message, None, model_name, model_type, cached_history=history)
@@ -591,7 +749,10 @@ TOOLS = [
                 "endpoint": {"type": "string"},
                 "deployment": {"type": "string"},
                 "model": {"type": "string"},
-                "model_type": {"type": "string", "enum": ["deployed", "serverless", "google"]},
+                "model_type": {"type": "string", "enum": ["deployed", "serverless", "bedrock", "google"]},
+                "aws_access_key": {"type": "string", "description": "AWS Access Key ID for Bedrock."},
+                "aws_secret_key": {"type": "string", "description": "AWS Secret Access Key for Bedrock."},
+                "aws_region": {"type": "string", "description": "AWS region for Bedrock (default: us-east-1)."},
                 "max_completion_tokens": {"type": "integer"},
                 "temperature": {"type": "number"},
                 "system_prompt": {"type": "string"},
@@ -828,20 +989,21 @@ def _handle_configure(args):
         "max_completion_tokens", "temperature", "system_prompt",
         "conversation_max_turns", "voice", "default_models", "multi_chat_timeout",
         "google_api_key", "google_project", "google_region",
+        "aws_access_key", "aws_secret_key", "aws_region",
     }
     updated = []
     for k, v in args.items():
         if k not in settable: continue
-        if k in ("api_key", "google_api_key"): CONFIG[k] = str(v)
+        if k in ("api_key", "google_api_key", "aws_access_key", "aws_secret_key"): CONFIG[k] = str(v)
         elif k == "endpoint": CONFIG[k] = str(v).rstrip("/")
-        elif k in ("deployment", "model", "model_type", "system_prompt", "voice", "google_project", "google_region"): CONFIG[k] = str(v)
+        elif k in ("deployment", "model", "model_type", "system_prompt", "voice", "google_project", "google_region", "aws_region"): CONFIG[k] = str(v)
         elif k == "max_completion_tokens": CONFIG[k] = max(1, min(int(v), 128000))
         elif k == "temperature": CONFIG[k] = max(0.0, min(float(v), 2.0))
         elif k == "conversation_max_turns": CONFIG[k] = max(1, min(int(v), 500))
         elif k == "default_models": CONFIG[k] = list(v) if isinstance(v, list) else [str(v)]
         elif k == "multi_chat_timeout": CONFIG[k] = max(1, min(int(v), 120))
         else: CONFIG[k] = v
-        updated.append(f"{k}={CONFIG[k]}" if k not in ("api_key", "google_api_key") else f"{k}=***{str(v)[-4:]}")
+        updated.append(f"{k}={CONFIG[k]}" if k not in ("api_key", "google_api_key", "aws_access_key", "aws_secret_key") else f"{k}=***{str(v)[-4:]}")
 
     if updated:
         save_config()
@@ -873,6 +1035,14 @@ def _handle_configure(args):
     lines.append(f"  region:      {CONFIG.get('google_region', 'global')}")
     gurl = _google_base_url()
     lines.append(f"  endpoint:    {gurl or '(set google_project to enable)'}")
+    lines.append("")
+    lines.append("[AWS Bedrock]")
+    aws_key = CONFIG.get("aws_access_key", "")
+    aws_secret = CONFIG.get("aws_secret_key", "")
+    lines.append(f"  access_key:  ***{aws_key[-4:]}" if aws_key else "  access_key:  (not set)")
+    lines.append(f"  secret_key:  ***{aws_secret[-4:]}" if aws_secret else "  secret_key:  (not set)")
+    lines.append(f"  region:      {CONFIG.get('aws_region', 'us-east-1')}")
+    lines.append(f"  models:      {', '.join(list(BEDROCK_MODELS.keys())[:5])}...")
     return "\n".join(lines)
 
 
@@ -912,12 +1082,27 @@ async def _handle_models(client, args, progress_token):
             lines.append(f"  {m}: {status}")
         else:
             lines.append(f"  {m}")
+
+    lines.append("\n[AWS Bedrock]")
+    if CONFIG.get("aws_access_key") and CONFIG.get("aws_secret_key"):
+        for m in BEDROCK_MODELS.keys():
+            if do_test:
+                text, _, latency = await _test_model(client, m, "bedrock")
+                status = f"OK ({latency:.0f}ms)" if not text.startswith("Error") else "unavailable"
+                lines.append(f"  {m}: {status}")
+            else:
+                lines.append(f"  {m}")
+    else:
+        lines.append("  (set aws_access_key and aws_secret_key to enable)")
     return "\n".join(lines)
 
 
 async def _test_model(client, name, mtype):
     try:
-        if mtype == "google":
+        if mtype == "bedrock":
+            messages = [{"role": "user", "content": "hi"}]
+            return await call_bedrock(client, messages, None, name)
+        elif mtype == "google":
             google_ep = _google_base_url()
             url = f"{google_ep}/chat/completions"
             body = {"messages": [{"role": "user", "content": "hi"}], "model": f"google/{name}", "max_tokens": 10}
