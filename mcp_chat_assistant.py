@@ -58,14 +58,32 @@ DEFAULTS = {
 
 # ── Model Catalogs ──────────────────────────────────────────────────────────
 
-# Azure AI Foundry models
-AZURE_DEPLOYED = ["gpt-5.3-chat", "o1", "o4-mini"]
+# Azure AI Foundry models (verified 2026-03)
+# Deployed models require explicit deployment in Azure portal
+AZURE_DEPLOYED = [
+    # OpenAI reasoning
+    "o1", "o4-mini", "o1-mini", "o1-preview", "o3-mini",
+    # OpenAI GPT
+    "gpt-5.3-chat", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-35-turbo",
+    # Embeddings
+    "text-embedding-3-large", "text-embedding-3-small",
+]
+# Serverless models are always available (pay-per-use)
 AZURE_SERVERLESS = [
+    # xAI
     "grok-3", "grok-3-mini",
+    # DeepSeek
+    "DeepSeek-R1",
+    # Meta Llama
     "Meta-Llama-3.1-405B-Instruct", "Meta-Llama-3.1-8B-Instruct",
     "Llama-3.2-11B-Vision-Instruct", "Llama-3.2-90B-Vision-Instruct",
-    "Phi-4", "DeepSeek-R1",
+    "Llama-3.3-70B-Instruct",
+    "Llama-4-Scout-17B-16E-Instruct",
+    # Microsoft
+    "Phi-4",
+    # Cohere
     "Cohere-command-r-plus-08-2024", "Cohere-command-r-08-2024",
+    # Mistral
     "Codestral-2501", "Ministral-3B",
 ]
 
@@ -851,6 +869,11 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "scan",
+        "description": "Scan all models and show availability matrix with deployed/available status and latency.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -984,6 +1007,10 @@ async def _run_tool(client, req_id, tool_name, args, progress_token):
         res = await _handle_models(client, args, progress_token)
         await _write_response(_result(req_id, res))
 
+    elif tool_name == "scan":
+        res = await _handle_scan(client, progress_token)
+        await _write_response(_result(req_id, res))
+
     else:
         await _write_response({
             "jsonrpc": "2.0", "id": req_id,
@@ -1097,10 +1124,18 @@ async def _handle_models(client, args, progress_token):
         sections = {"Azure Deployed": [], "Azure Serverless": [], "Google Vertex AI": [], "AWS Bedrock": []}
         for (name, mtype, section), result in zip(model_info, results):
             if isinstance(result, Exception):
-                sections[section].append(f"  {name}: unavailable")
+                status = "can deploy" if section == "Azure Deployed" else "unavailable"
+                sections[section].append(f"  {name}: {status}")
             else:
                 text, _, latency = result
-                status = f"OK ({latency:.0f}ms)" if not text.startswith("Error") else "unavailable"
+                if text.startswith("Error"):
+                    # For deployed models, 404 means not deployed yet
+                    if section == "Azure Deployed" and "404" in text:
+                        status = "can deploy"
+                    else:
+                        status = "unavailable"
+                else:
+                    status = f"✓ ({latency:.0f}ms)"
                 sections[section].append(f"  {name}: {status}")
 
         lines = [f"Endpoint: {endpoint}\n"]
@@ -1161,6 +1196,93 @@ async def _test_model(client, name, mtype):
         return data["choices"][0]["message"]["content"], data.get("usage", {}), latency
     except Exception as e:
         return f"Error: {e}", {}, 0
+
+
+async def _handle_scan(client, progress_token):
+    """Scan all models and return a formatted availability matrix."""
+    api_key = CONFIG.get("api_key", "")
+    endpoint = CONFIG.get("endpoint", "")
+    if not api_key or not endpoint:
+        return "Error: api_key and endpoint required. Use configure tool to set them."
+
+    has_aws = CONFIG.get("aws_access_key") and CONFIG.get("aws_secret_key")
+    has_google = CONFIG.get("google_api_key")
+
+    # Build test tasks
+    all_tests = []
+    model_info = []  # (name, type, section)
+
+    for m in AZURE_DEPLOYED:
+        all_tests.append(_test_model(client, m, "deployed"))
+        model_info.append((m, "deployed", "Azure Deployed"))
+    for m in AZURE_SERVERLESS:
+        all_tests.append(_test_model(client, m, "serverless"))
+        model_info.append((m, "serverless", "Azure Serverless"))
+    if has_google:
+        for m in GOOGLE_MODELS:
+            all_tests.append(_test_model(client, m, "google"))
+            model_info.append((m, "google", "Google Gemini"))
+    if has_aws:
+        for m in BEDROCK_MODELS.keys():
+            all_tests.append(_test_model(client, m, "bedrock"))
+            model_info.append((m, "bedrock", "AWS Bedrock"))
+
+    if progress_token:
+        await _send_progress(progress_token, 0.1, f"Testing {len(all_tests)} models...")
+
+    # Run all tests in parallel
+    results = await asyncio.gather(*all_tests, return_exceptions=True)
+
+    if progress_token:
+        await _send_progress(progress_token, 0.9, "Formatting results...")
+
+    # Build table output
+    lines = ["## Model Availability Scan\n"]
+
+    sections = {"Azure Deployed": [], "Azure Serverless": [], "Google Gemini": [], "AWS Bedrock": []}
+    counts = {"pass": 0, "fail": 0, "deploy": 0}
+
+    for (name, mtype, section), result in zip(model_info, results):
+        if isinstance(result, Exception):
+            if section == "Azure Deployed":
+                status = "can deploy"
+                counts["deploy"] += 1
+            else:
+                status = "✗ error"
+                counts["fail"] += 1
+        else:
+            text, _, latency = result
+            if text.startswith("Error"):
+                if section == "Azure Deployed" and "404" in text:
+                    status = "can deploy"
+                    counts["deploy"] += 1
+                else:
+                    status = "✗ unavailable"
+                    counts["fail"] += 1
+            else:
+                status = f"✓ {latency:.0f}ms"
+                counts["pass"] += 1
+        sections[section].append(f"| {name:<35} | {status:<15} |")
+
+    for section in ["Azure Deployed", "Azure Serverless", "Google Gemini", "AWS Bedrock"]:
+        if not sections[section]:
+            if section == "Google Gemini" and not has_google:
+                lines.append(f"### {section}\n_(set google_api_key to enable)_\n")
+            elif section == "AWS Bedrock" and not has_aws:
+                lines.append(f"### {section}\n_(set aws_access_key and aws_secret_key to enable)_\n")
+            continue
+        lines.append(f"### {section}")
+        lines.append("| Model | Status |")
+        lines.append("|-------|--------|")
+        lines.extend(sections[section])
+        lines.append("")
+
+    lines.append(f"**Summary:** {counts['pass']} working, {counts['fail']} unavailable, {counts['deploy']} can deploy")
+
+    if progress_token:
+        await _send_progress(progress_token, 1.0, "Scan complete")
+
+    return "\n".join(lines)
 
 
 # ── MCP transport ───────────────────────────────────────────────────────────
