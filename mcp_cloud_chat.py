@@ -22,6 +22,8 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 import sqlite3
@@ -31,8 +33,15 @@ import httpx
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-CONFIG_PATH = os.path.expanduser("~/.config/azure-chat-assistant/config.json")
-DB_PATH = os.path.expanduser("~/.config/azure-chat-assistant/sessions.db")
+CONFIG_DIR = os.path.expanduser("~/.config/cloud-chat-assistant")
+_OLD_CONFIG_DIR = os.path.expanduser("~/.config/azure-chat-assistant")
+
+# Migrate from old location if needed
+if os.path.exists(_OLD_CONFIG_DIR) and not os.path.exists(CONFIG_DIR):
+    os.rename(_OLD_CONFIG_DIR, CONFIG_DIR)
+
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+DB_PATH = os.path.join(CONFIG_DIR, "sessions.db")
 
 DEFAULTS = {
     "api_key": "",
@@ -110,6 +119,144 @@ BEDROCK_MODELS = {
     "palmyra-x4": "us.writer.palmyra-x4-v1:0",
     "palmyra-x5": "us.writer.palmyra-x5-v1:0",
 }
+
+# ── CLI Helpers ────────────────────────────────────────────────────────────
+
+def _cli_available(name):
+    """Check if a CLI tool is available."""
+    return shutil.which(name) is not None
+
+async def _run_cli(cmd, timeout=30):
+    """Run CLI command async and return stdout or None on error."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        if proc.returncode == 0:
+            return stdout.decode().strip()
+        return None
+    except Exception:
+        return None
+
+async def _az_list_deployable_models():
+    """Use Azure CLI to list deployable OpenAI models."""
+    if not _cli_available("az"):
+        return None
+    # Extract resource name from endpoint
+    endpoint = CONFIG.get("endpoint", "")
+    if not endpoint:
+        return None
+    # Endpoint format: https://<resource-name>.openai.azure.com or similar
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(endpoint).hostname
+        resource_name = host.split(".")[0] if host else None
+    except Exception:
+        return None
+    if not resource_name:
+        return None
+    # Get resource group (try env var first, then query Azure)
+    rg = os.environ.get("AZURE_RESOURCE_GROUP", "")
+    if not rg:
+        # Try to find the resource group
+        out = await _run_cli(["az", "resource", "list", "--name", resource_name, "--query", "[0].resourceGroup", "-o", "tsv"])
+        if out:
+            rg = out.strip()
+    if not rg:
+        return None
+    # List models
+    out = await _run_cli(["az", "cognitiveservices", "account", "list-models", "--name", resource_name, "--resource-group", rg, "-o", "json"])
+    if not out:
+        return None
+    try:
+        models = json.loads(out)
+        # Filter to chat completion models, dedupe by name
+        seen = set()
+        deployable = []
+        for m in models:
+            name = m.get("name", "")
+            if name in seen:
+                continue
+            seen.add(name)
+            caps = m.get("capabilities", {})
+            # Include chat/completion models, exclude embedding-only and rerank
+            if "embed" in name.lower() or "rerank" in name.lower():
+                continue
+            if caps.get("chatCompletion") or caps.get("completion") or any(k in name.lower() for k in ["gpt", "llama", "phi", "claude", "mistral", "deepseek", "grok", "cohere", "gemini", "qwen", "jamba", "kimi"]) or name.startswith("o"):
+                deployable.append(name)
+        return deployable
+    except Exception:
+        return None
+
+async def _az_list_deployed():
+    """Use Azure CLI to list currently deployed models."""
+    if not _cli_available("az"):
+        return None
+    endpoint = CONFIG.get("endpoint", "")
+    if not endpoint:
+        return None
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(endpoint).hostname
+        resource_name = host.split(".")[0] if host else None
+    except Exception:
+        return None
+    if not resource_name:
+        return None
+    rg = os.environ.get("AZURE_RESOURCE_GROUP", "")
+    if not rg:
+        out = await _run_cli(["az", "resource", "list", "--name", resource_name, "--query", "[0].resourceGroup", "-o", "tsv"])
+        if out:
+            rg = out.strip()
+    if not rg:
+        return None
+    out = await _run_cli(["az", "cognitiveservices", "account", "deployment", "list", "--name", resource_name, "--resource-group", rg, "-o", "json"])
+    if not out:
+        return None
+    try:
+        deployments = json.loads(out)
+        return [d.get("name", "") for d in deployments if d.get("name")]
+    except Exception:
+        return None
+
+async def _aws_list_bedrock_models():
+    """Use AWS CLI to list available Bedrock models."""
+    if not _cli_available("aws"):
+        return None
+    region = CONFIG.get("aws_region", "us-east-1")
+    out = await _run_cli(["aws", "bedrock", "list-foundation-models", "--region", region, "--output", "json"])
+    if not out:
+        return None
+    try:
+        data = json.loads(out)
+        models = []
+        for m in data.get("modelSummaries", []):
+            model_id = m.get("modelId", "")
+            # Include chat/text models, skip embedding-only
+            if m.get("outputModalities") and "TEXT" in m.get("outputModalities", []):
+                models.append(model_id)
+        return models
+    except Exception:
+        return None
+
+async def _gcloud_list_models():
+    """Use gcloud to list Vertex AI models."""
+    if not _cli_available("gcloud"):
+        return None
+    region = CONFIG.get("google_region", "us-east4")
+    if region == "global":
+        region = "us-east4"  # gcloud needs a specific region
+    out = await _run_cli(["gcloud", "ai", "models", "list", f"--region={region}", "--format=json"])
+    if not out:
+        return None
+    try:
+        models = json.loads(out)
+        return [m.get("displayName", m.get("name", "")) for m in models]
+    except Exception:
+        return None
 
 CONFIG = {}
 _conversation_history = []          # list of {"role": ..., "content": ...}
@@ -360,9 +507,9 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
     max_tokens = CONFIG.get("max_completion_tokens", 2048)
     temperature = CONFIG.get("temperature", 1.0)
 
-    # Route to Bedrock if model type is bedrock
+    # Route to Bedrock if model type is bedrock (use deployment for model name)
     if model_type == "bedrock":
-        return await call_bedrock(client, messages, progress_token, model)
+        return await call_bedrock(client, messages, progress_token, deployment)
 
     # Reasoning models (o1, o3, o4) use "developer" role instead of "system"
     is_reasoning = any(deployment.startswith(p) or model.startswith(p) for p in ("o1", "o3", "o4"))
@@ -1199,7 +1346,11 @@ async def _test_model(client, name, mtype):
 
 
 async def _handle_scan(client, progress_token):
-    """Scan all models and return a formatted availability matrix."""
+    """Scan all models and return a formatted availability matrix.
+
+    Uses CLI tools (az, aws, gcloud) for dynamic discovery when available,
+    falls back to hardcoded lists otherwise.
+    """
     api_key = CONFIG.get("api_key", "")
     endpoint = CONFIG.get("endpoint", "")
     if not api_key or not endpoint:
@@ -1208,27 +1359,83 @@ async def _handle_scan(client, progress_token):
     has_aws = CONFIG.get("aws_access_key") and CONFIG.get("aws_secret_key")
     has_google = CONFIG.get("google_api_key")
 
+    lines = ["## Model Availability Scan\n"]
+    cli_info = []
+
+    # Check CLI availability
+    has_az = _cli_available("az")
+    has_aws_cli = _cli_available("aws")
+    has_gcloud = _cli_available("gcloud")
+    cli_info.append(f"CLIs: az={'yes' if has_az else 'no'}, aws={'yes' if has_aws_cli else 'no'}, gcloud={'yes' if has_gcloud else 'no'}")
+
+    if progress_token:
+        await _send_progress(progress_token, 0.05, "Discovering models via CLI...")
+
+    # Dynamic model discovery
+    az_deployable = None
+    az_deployed = None
+    bedrock_models = None
+
+    # Run CLI queries in parallel
+    cli_tasks = []
+    if has_az:
+        cli_tasks.append(("az_deployable", _az_list_deployable_models()))
+        cli_tasks.append(("az_deployed", _az_list_deployed()))
+    if has_aws_cli and has_aws:
+        cli_tasks.append(("bedrock", _aws_list_bedrock_models()))
+
+    if cli_tasks:
+        cli_results = await asyncio.gather(*[t[1] for t in cli_tasks], return_exceptions=True)
+        for (name, _), result in zip(cli_tasks, cli_results):
+            if isinstance(result, Exception):
+                continue
+            if name == "az_deployable":
+                az_deployable = result
+            elif name == "az_deployed":
+                az_deployed = result
+            elif name == "bedrock":
+                bedrock_models = result
+
+    # Build model lists with dynamic discovery fallback
+    azure_deployed_models = az_deployable if az_deployable else AZURE_DEPLOYED
+    already_deployed = set(az_deployed) if az_deployed else set()
+
+    if az_deployable:
+        cli_info.append(f"Azure: {len(az_deployable)} deployable models from CLI, {len(already_deployed)} deployed")
+    else:
+        cli_info.append("Azure: using hardcoded model list (az CLI not available or auth failed)")
+
+    if bedrock_models:
+        cli_info.append(f"Bedrock: {len(bedrock_models)} models from CLI")
+    else:
+        cli_info.append("Bedrock: using hardcoded model list")
+
+    if progress_token:
+        await _send_progress(progress_token, 0.1, f"Testing models...")
+
     # Build test tasks
     all_tests = []
-    model_info = []  # (name, type, section)
+    model_info = []  # (name, type, section, is_deployed)
 
-    for m in AZURE_DEPLOYED:
+    for m in azure_deployed_models:
         all_tests.append(_test_model(client, m, "deployed"))
-        model_info.append((m, "deployed", "Azure Deployed"))
+        model_info.append((m, "deployed", "Azure OpenAI", m in already_deployed))
     for m in AZURE_SERVERLESS:
         all_tests.append(_test_model(client, m, "serverless"))
-        model_info.append((m, "serverless", "Azure Serverless"))
+        model_info.append((m, "serverless", "Azure Serverless", True))
     if has_google:
         for m in GOOGLE_MODELS:
             all_tests.append(_test_model(client, m, "google"))
-            model_info.append((m, "google", "Google Gemini"))
+            model_info.append((m, "google", "Google Gemini", True))
     if has_aws:
-        for m in BEDROCK_MODELS.keys():
+        # Use CLI-discovered Bedrock models or fall back to hardcoded
+        bedrock_to_test = list(BEDROCK_MODELS.keys())  # Always use friendly names
+        for m in bedrock_to_test:
             all_tests.append(_test_model(client, m, "bedrock"))
-            model_info.append((m, "bedrock", "AWS Bedrock"))
+            model_info.append((m, "bedrock", "AWS Bedrock", True))
 
     if progress_token:
-        await _send_progress(progress_token, 0.1, f"Testing {len(all_tests)} models...")
+        await _send_progress(progress_token, 0.15, f"Testing {len(all_tests)} models...")
 
     # Run all tests in parallel
     results = await asyncio.gather(*all_tests, return_exceptions=True)
@@ -1237,34 +1444,37 @@ async def _handle_scan(client, progress_token):
         await _send_progress(progress_token, 0.9, "Formatting results...")
 
     # Build table output
-    lines = ["## Model Availability Scan\n"]
+    sections = {"Azure OpenAI": [], "Azure Serverless": [], "Google Gemini": [], "AWS Bedrock": []}
+    counts = {"pass": 0, "fail": 0, "deploy": 0, "deployed": 0}
 
-    sections = {"Azure Deployed": [], "Azure Serverless": [], "Google Gemini": [], "AWS Bedrock": []}
-    counts = {"pass": 0, "fail": 0, "deploy": 0}
-
-    for (name, mtype, section), result in zip(model_info, results):
+    for (name, mtype, section, is_deployed), result in zip(model_info, results):
         if isinstance(result, Exception):
-            if section == "Azure Deployed":
+            if section == "Azure OpenAI" and not is_deployed:
                 status = "can deploy"
                 counts["deploy"] += 1
             else:
-                status = "✗ error"
+                status = "error"
                 counts["fail"] += 1
         else:
             text, _, latency = result
             if text.startswith("Error"):
-                if section == "Azure Deployed" and "404" in text:
+                if section == "Azure OpenAI" and ("404" in text or "not found" in text.lower()):
                     status = "can deploy"
                     counts["deploy"] += 1
                 else:
-                    status = "✗ unavailable"
+                    status = "unavailable"
                     counts["fail"] += 1
             else:
-                status = f"✓ {latency:.0f}ms"
+                status = f"{latency:.0f}ms"
                 counts["pass"] += 1
-        sections[section].append(f"| {name:<35} | {status:<15} |")
+                if section == "Azure OpenAI" and is_deployed:
+                    counts["deployed"] += 1
+        sections[section].append(f"| {name:<40} | {status:<15} |")
 
-    for section in ["Azure Deployed", "Azure Serverless", "Google Gemini", "AWS Bedrock"]:
+    # Output CLI info
+    lines.append("_" + " | ".join(cli_info) + "_\n")
+
+    for section in ["Azure OpenAI", "Azure Serverless", "Google Gemini", "AWS Bedrock"]:
         if not sections[section]:
             if section == "Google Gemini" and not has_google:
                 lines.append(f"### {section}\n_(set google_api_key to enable)_\n")
@@ -1277,7 +1487,7 @@ async def _handle_scan(client, progress_token):
         lines.extend(sections[section])
         lines.append("")
 
-    lines.append(f"**Summary:** {counts['pass']} working, {counts['fail']} unavailable, {counts['deploy']} can deploy")
+    lines.append(f"**Summary:** {counts['pass']} working ({counts['deployed']} deployed), {counts['fail']} unavailable, {counts['deploy']} can deploy")
 
     if progress_token:
         await _send_progress(progress_token, 1.0, "Scan complete")
