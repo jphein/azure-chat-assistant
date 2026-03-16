@@ -353,6 +353,26 @@ def load_config():
         val = os.environ.get(env_key, "")
         if val:
             cfg[cfg_key] = val
+    # Fall back to ~/.aws/credentials if AWS keys still empty
+    if not cfg.get("aws_access_key") or not cfg.get("aws_secret_key"):
+        aws_creds = os.path.join(os.path.expanduser("~"), ".aws", "credentials")
+        if os.path.exists(aws_creds):
+            try:
+                import configparser
+                cp = configparser.ConfigParser()
+                cp.read(str(aws_creds))
+                profile = os.environ.get("AWS_PROFILE", "default")
+                if cp.has_section(profile):
+                    ak = cp.get(profile, "aws_access_key_id", fallback="")
+                    sk = cp.get(profile, "aws_secret_access_key", fallback="")
+                    if ak and sk:
+                        cfg["aws_access_key"] = ak
+                        cfg["aws_secret_key"] = sk
+                        rg = cp.get(profile, "region", fallback="")
+                        if rg and not cfg.get("aws_region"):
+                            cfg["aws_region"] = rg
+            except Exception:
+                pass
     return cfg
 
 

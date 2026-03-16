@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "azure-chat-assistant": {
-      "command": "python3",
-      "args": ["/home/jp/Projects/azure-chat-assistant/mcp_chat_assistant.py"]
+    "cloud-chat-assistant": {
+      "command": "/home/jp/Projects/cloud-chat-assistant/venv/bin/python3",
+      "args": ["/home/jp/Projects/cloud-chat-assistant/mcp_cloud_chat.py"]
     }
   }
 }
