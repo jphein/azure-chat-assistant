@@ -138,12 +138,27 @@ gcloud auth login
 
 See [CLI_SETUP.md](CLI_SETUP.md) for detailed instructions.
 
-## Voice Integration
+## Ecosystem
 
-Pair with the [azure-speech](https://github.com/jphein/speech-to-cli) MCP server for voice conversations:
+This project is part of a four-project voice AI system:
+
+| Project | Role |
+|---------|------|
+| [speech-to-cli](https://github.com/jphein/speech-to-cli) | Audio engine — STT, TTS, VAD, recorder |
+| **cloud-chat-assistant** (this) | Multi-cloud LLM provider |
+| [gnome-speaks](https://github.com/jphein/gnome-speaks) | GNOME Shell extension — desktop voice UI |
+| [the-oracle](https://github.com/jphein/the-oracle) | Web frontend — proxies both MCP servers |
+
+### Voice Integration
+
+Pair with [speech-to-cli](https://github.com/jphein/speech-to-cli) for voice conversations:
 
 1. `multi_chat` — queries all models in parallel
 2. `multi_speak` — synthesizes all responses, plays sequentially
+
+### GNOME Speaks Integration
+
+[gnome-speaks](https://github.com/jphein/gnome-speaks) can call cloud-chat-assistant directly for AI conversation mode, and its preferences panel can configure this project's settings (`~/.config/cloud-chat-assistant/config.json`) — including provider credentials, generation parameters, and model selection — from a unified GNOME settings UI.
 
 ## Architecture
 
