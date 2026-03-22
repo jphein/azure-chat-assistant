@@ -1,3 +1,4 @@
+<!-- claude-md-version: c3113ea | updated: 2026-03-22 -->
 # Cloud Chat Assistant — MCP Server
 
 Multi-cloud MCP server for Claude Code — connects to Azure AI Foundry, AWS Bedrock, Google Vertex AI, and DigitalOcean.
