@@ -65,6 +65,8 @@ DEFAULTS = {
     "aws_region": "us-east-1",
     # DigitalOcean
     "do_api_key": "",
+    # Puter
+    "puter_api_key": "",
 }
 
 # ── Model Catalogs ──────────────────────────────────────────────────────────
@@ -121,6 +123,19 @@ DO_MODELS = [
     "minimax-m2.5", "kimi-k2.5", "glm-5",
 ]
 DO_ENDPOINT = "https://inference.do-ai.run/v1"
+
+# Puter AI (OpenAI-compatible, free with auth token)
+PUTER_MODELS = [
+    "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001",
+    "claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929",
+    "gpt-5.4-2026-03-05", "gpt-5.2-chat-latest", "o3", "o3-pro", "o4-mini",
+    "gpt-4o", "gpt-4o-mini",
+    "deepseek-chat", "deepseek-reasoner",
+    "grok-4", "grok-4-fast", "grok-3",
+    "gemini-2.5-pro", "gemini-2.5-flash",
+    "mistral-large-latest",
+]
+PUTER_ENDPOINT = "https://api.puter.com/puterai/openai/v1"
 
 # AWS Bedrock model IDs (cross-region inference profiles)
 BEDROCK_MODELS = {
@@ -409,7 +424,7 @@ def save_config():
         if k in DEFAULTS and CONFIG[k] == DEFAULTS[k]:
             continue
         disk[k] = v
-    for k in ("api_key", "endpoint", "deployment", "model", "model_type", "google_api_key", "google_project", "google_region", "aws_access_key", "aws_secret_key", "aws_region", "do_api_key"):
+    for k in ("api_key", "endpoint", "deployment", "model", "model_type", "google_api_key", "google_project", "google_region", "aws_access_key", "aws_secret_key", "aws_region", "do_api_key", "puter_api_key"):
         disk[k] = CONFIG.get(k, "")
     with open(CONFIG_PATH, "w") as f:
         json.dump(disk, f, indent=4)
@@ -555,8 +570,25 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
     if model_type == "bedrock":
         return await call_bedrock(client, messages, progress_token, deployment)
 
+    # Route to Puter OpenAI-compatible endpoint
+    if model_type == "puter":
+        puter_key = CONFIG.get("puter_api_key", "")
+        if not puter_key:
+            return "Error: No Puter API key configured. Use configure tool to set puter_api_key.", {}, 0
+        url = f"{PUTER_ENDPOINT}/chat/completions"
+        body = {
+            "messages": messages,
+            "model": model,
+            "max_completion_tokens": max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        headers = {
+            "Authorization": f"Bearer {puter_key}",
+            "Content-Type": "application/json",
+        }
     # Route to DigitalOcean Serverless Inference
-    if model_type == "digitalocean":
+    elif model_type == "digitalocean":
         do_key = CONFIG.get("do_api_key", "")
         if not do_key:
             return "Error: No DigitalOcean API key configured. Use configure tool to set do_api_key.", {}, 0
@@ -887,6 +919,8 @@ async def multi_chat(client, user_message, models=None, progress_token=None):
         ml = model_name.lower()
         if model_name in DO_MODELS:
             return "digitalocean"
+        if model_name in PUTER_MODELS:
+            return "puter"
         if "gemini" in ml:
             return "google"
         if model_name in BEDROCK_MODELS or "claude" in ml or "anthropic" in ml or "nova" in ml or "llama4" in ml:
@@ -996,7 +1030,7 @@ TOOLS = [
                 "endpoint": {"type": "string"},
                 "deployment": {"type": "string"},
                 "model": {"type": "string"},
-                "model_type": {"type": "string", "enum": ["deployed", "serverless", "bedrock", "google", "digitalocean"]},
+                "model_type": {"type": "string", "enum": ["deployed", "serverless", "bedrock", "google", "digitalocean", "puter"]},
                 "aws_access_key": {"type": "string", "description": "AWS Access Key ID for Bedrock."},
                 "aws_secret_key": {"type": "string", "description": "AWS Secret Access Key for Bedrock."},
                 "aws_region": {"type": "string", "description": "AWS region for Bedrock (default: us-east-1)."},
@@ -1018,6 +1052,7 @@ TOOLS = [
                 "google_project": {"type": "string", "description": "Google Cloud project ID or number."},
                 "google_region": {"type": "string", "description": "Vertex AI region (default: global)."},
                 "do_api_key": {"type": "string", "description": "DigitalOcean model access key for Serverless Inference."},
+                "puter_api_key": {"type": "string", "description": "Puter auth token for OpenAI-compatible AI endpoint."},
             },
         },
     },
@@ -1246,12 +1281,12 @@ def _handle_configure(args):
         "conversation_max_turns", "voice", "default_models", "multi_chat_timeout",
         "google_api_key", "google_project", "google_region",
         "aws_access_key", "aws_secret_key", "aws_region",
-        "do_api_key",
+        "do_api_key", "puter_api_key",
     }
     updated = []
     for k, v in args.items():
         if k not in settable: continue
-        if k in ("api_key", "google_api_key", "aws_access_key", "aws_secret_key", "do_api_key"): CONFIG[k] = str(v)
+        if k in ("api_key", "google_api_key", "aws_access_key", "aws_secret_key", "do_api_key", "puter_api_key"): CONFIG[k] = str(v)
         elif k == "endpoint": CONFIG[k] = str(v).rstrip("/")
         elif k in ("deployment", "model", "model_type", "system_prompt", "voice", "google_project", "google_region", "aws_region"): CONFIG[k] = str(v)
         elif k == "max_completion_tokens": CONFIG[k] = max(1, min(int(v), 128000))
@@ -1260,7 +1295,7 @@ def _handle_configure(args):
         elif k == "default_models": CONFIG[k] = list(v) if isinstance(v, list) else [str(v)]
         elif k == "multi_chat_timeout": CONFIG[k] = max(1, min(int(v), 120))
         else: CONFIG[k] = v
-        updated.append(f"{k}={CONFIG[k]}" if k not in ("api_key", "google_api_key", "aws_access_key", "aws_secret_key", "do_api_key") else f"{k}=***{str(v)[-4:]}")
+        updated.append(f"{k}={CONFIG[k]}" if k not in ("api_key", "google_api_key", "aws_access_key", "aws_secret_key", "do_api_key", "puter_api_key") else f"{k}=***{str(v)[-4:]}")
 
     if updated:
         save_config()
@@ -1306,6 +1341,12 @@ def _handle_configure(args):
     lines.append(f"  api_key:     ***{do_key[-4:]}" if do_key else "  api_key:     (not set)")
     lines.append(f"  endpoint:    {DO_ENDPOINT}")
     lines.append(f"  models:      {', '.join(DO_MODELS[:5])}...")
+    lines.append("")
+    lines.append("[Puter]")
+    puter_key = CONFIG.get("puter_api_key", "")
+    lines.append(f"  api_key:     ***{puter_key[-4:]}" if puter_key else "  api_key:     (not set)")
+    lines.append(f"  endpoint:    {PUTER_ENDPOINT}")
+    lines.append(f"  models:      {', '.join(PUTER_MODELS[:5])}...")
     return "\n".join(lines)
 
 
@@ -1412,6 +1453,10 @@ async def _test_model(client, name, mtype):
             url = f"{DO_ENDPOINT}/chat/completions"
             body = {"messages": [{"role": "user", "content": "hi"}], "model": name, "max_completion_tokens": 256}
             headers = {"Authorization": f"Bearer {CONFIG.get('do_api_key', '')}", "Content-Type": "application/json"}
+        elif mtype == "puter":
+            url = f"{PUTER_ENDPOINT}/chat/completions"
+            body = {"messages": [{"role": "user", "content": "hi"}], "model": name, "max_completion_tokens": 256}
+            headers = {"Authorization": f"Bearer {CONFIG.get('puter_api_key', '')}", "Content-Type": "application/json"}
         elif mtype == "google":
             google_ep = _google_base_url()
             url = f"{google_ep}/chat/completions"
