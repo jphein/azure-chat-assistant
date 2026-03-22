@@ -371,6 +371,7 @@ ENV_MAP = {
     "aws_secret_key": "AWS_SECRET_ACCESS_KEY",
     "aws_region":     "AWS_DEFAULT_REGION",
     "do_api_key":     "DIGITALOCEAN_API_KEY",
+    "puter_api_key":  "PUTER_API_KEY",
 }
 
 
@@ -1139,7 +1140,7 @@ async def handle_request(client, req):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": True}},
-                "serverInfo": {"name": "azure-chat-assistant", "version": "1.2.0-async"},
+                "serverInfo": {"name": "cloud-chat-assistant", "version": "1.2.0-async"},
             },
         })
     elif method == "notifications/initialized":

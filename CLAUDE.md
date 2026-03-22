@@ -3,7 +3,8 @@
 Multi-cloud MCP server for Claude Code — connects to Azure AI Foundry, AWS Bedrock, Google Vertex AI, and DigitalOcean.
 
 ## File Map
-- `mcp_cloud_chat.py` — The entire server (~1450 lines, async)
+- `mcp_cloud_chat.py` — The entire server (~1700 lines, async)
+- `setup.sh` — Creates venv, installs deps, prints MCP registration snippet
 - `CLI_SETUP.md` — Installation guide for az, aws, gcloud CLIs
 - `test_connection.py` — Standalone connection test (uses urllib, not async)
 
@@ -25,6 +26,7 @@ Multi-cloud MCP server for Claude Code — connects to Azure AI Foundry, AWS Bed
 | AWS Bedrock | bedrock | Claude 4.x, Nova, Llama 4, Writer |
 | Google Vertex | google | Gemini 2.5/3.x |
 | DigitalOcean | digitalocean | Claude, GPT, Llama, Mistral, DeepSeek, Qwen, etc. |
+| Puter | puter | Claude 4.x, GPT-5.x, o3/o4, DeepSeek, Grok, Gemini, Mistral |
 
 ## MCP Tools (12)
 `chat`, `multi_chat`, `configure`, `reset`, `clear_cache`, `status`, `models`, `scan`, `create_session`, `switch_session`, `delete_session`, `list_sessions`
@@ -41,7 +43,7 @@ The `scan` tool uses CLIs for dynamic model discovery:
 See `CLI_SETUP.md` for installation.
 
 ## Env Vars
-`AZURE_AI_API_KEY`, `AZURE_AI_ENDPOINT`, `GOOGLE_API_KEY`, `GOOGLE_PROJECT`, `GOOGLE_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `DIGITALOCEAN_API_KEY`
+`AZURE_AI_API_KEY`, `AZURE_AI_ENDPOINT`, `GOOGLE_API_KEY`, `GOOGLE_PROJECT`, `GOOGLE_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `DIGITALOCEAN_API_KEY`, `PUTER_API_KEY`
 
 ## How to Run
 ```bash
