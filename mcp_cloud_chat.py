@@ -63,6 +63,8 @@ DEFAULTS = {
     "aws_access_key": "",
     "aws_secret_key": "",
     "aws_region": "us-east-1",
+    # DigitalOcean
+    "do_api_key": "",
 }
 
 # ── Model Catalogs ──────────────────────────────────────────────────────────
@@ -98,6 +100,27 @@ AZURE_SERVERLESS = [
 
 # Google Vertex AI models
 GOOGLE_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.1-pro-preview"]
+
+# DigitalOcean Serverless Inference models (via inference.do-ai.run)
+DO_MODELS = [
+    # Anthropic
+    "anthropic-claude-opus-4.6", "anthropic-claude-4.6-sonnet",
+    "anthropic-claude-opus-4.5", "anthropic-claude-4.5-sonnet", "anthropic-claude-haiku-4.5",
+    "anthropic-claude-4.1-opus", "anthropic-claude-opus-4", "anthropic-claude-sonnet-4",
+    # OpenAI
+    "openai-gpt-5.4", "openai-gpt-5.3-codex", "openai-gpt-5.2", "openai-gpt-5.2-pro",
+    "openai-gpt-5", "openai-gpt-5-mini", "openai-gpt-5-nano",
+    "openai-gpt-4.1", "openai-gpt-4o", "openai-gpt-4o-mini",
+    "openai-o3", "openai-o3-mini", "openai-o1",
+    "openai-gpt-oss-120b", "openai-gpt-oss-20b",
+    # Meta
+    "llama3.3-70b-instruct", "llama3-8b-instruct",
+    # Other
+    "deepseek-r1-distill-llama-70b", "mistral-nemo-instruct-2407",
+    "nvidia-nemotron-3-super-120b", "alibaba-qwen3-32b",
+    "minimax-m2.5", "kimi-k2.5", "glm-5",
+]
+DO_ENDPOINT = "https://inference.do-ai.run/v1"
 
 # AWS Bedrock model IDs (cross-region inference profiles)
 BEDROCK_MODELS = {
@@ -332,6 +355,7 @@ ENV_MAP = {
     "aws_access_key": "AWS_ACCESS_KEY_ID",
     "aws_secret_key": "AWS_SECRET_ACCESS_KEY",
     "aws_region":     "AWS_DEFAULT_REGION",
+    "do_api_key":     "DIGITALOCEAN_API_KEY",
 }
 
 
@@ -385,7 +409,7 @@ def save_config():
         if k in DEFAULTS and CONFIG[k] == DEFAULTS[k]:
             continue
         disk[k] = v
-    for k in ("api_key", "endpoint", "deployment", "model", "model_type", "google_api_key", "google_project", "google_region", "aws_access_key", "aws_secret_key", "aws_region"):
+    for k in ("api_key", "endpoint", "deployment", "model", "model_type", "google_api_key", "google_project", "google_region", "aws_access_key", "aws_secret_key", "aws_region", "do_api_key"):
         disk[k] = CONFIG.get(k, "")
     with open(CONFIG_PATH, "w") as f:
         json.dump(disk, f, indent=4)
@@ -531,69 +555,90 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
     if model_type == "bedrock":
         return await call_bedrock(client, messages, progress_token, deployment)
 
-    # Reasoning models (o1, o3, o4) use "developer" role instead of "system"
-    is_reasoning = any(deployment.startswith(p) or model.startswith(p) for p in ("o1", "o3", "o4"))
-    if is_reasoning:
-        messages = [
-            {"role": "developer" if m["role"] == "system" else m["role"], "content": m["content"]}
-            for m in messages
-        ]
-
-    if model_type == "google":
-        google_key = CONFIG.get("google_api_key", "")
-        if not google_key:
-            return "Error: No Google API key configured. Use configure tool to set google_api_key.", {}, 0
-        google_ep = _google_base_url()
-        if not google_ep:
-            return "Error: No Google project configured. Use configure tool to set google_project.", {}, 0
-        url = f"{google_ep}/chat/completions"
-        body = {
-            "messages": messages,
-            "model": f"google/{model}",
-            "max_tokens": max_tokens,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        headers = {
-            "x-goog-api-key": google_key,
-            "Content-Type": "application/json",
-        }
-    elif model_type == "deployed":
-        if not api_key:
-            return "Error: No API key configured. Use configure tool to set api_key.", {}, 0
-        if not endpoint:
-            return "Error: No endpoint configured.", {}, 0
-        url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-12-01-preview"
-        body = {
-            "messages": messages,
-            "max_completion_tokens": max_tokens,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        headers = {
-            "api-key": api_key,
-            "Content-Type": "application/json",
-        }
-    else:  # serverless
-        if not api_key:
-            return "Error: No API key configured. Use configure tool to set api_key.", {}, 0
-        if not endpoint:
-            return "Error: No endpoint configured.", {}, 0
-        
-        # o1 and o4 models on serverless endpoints require a newer api-version
-        version = "2024-12-01-preview" if any(p in model.lower() for p in ("o1", "o4")) else "2024-05-01-preview"
-        url = f"{endpoint}/models/chat/completions?api-version={version}"
+    # Route to DigitalOcean Serverless Inference
+    if model_type == "digitalocean":
+        do_key = CONFIG.get("do_api_key", "")
+        if not do_key:
+            return "Error: No DigitalOcean API key configured. Use configure tool to set do_api_key.", {}, 0
+        url = f"{DO_ENDPOINT}/chat/completions"
         body = {
             "messages": messages,
             "model": model,
-            "max_tokens": max_tokens,
+            "max_completion_tokens": max(256, max_tokens),  # DO enforces 256 minimum
+            "temperature": temperature,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
         headers = {
-            "api-key": api_key,
+            "Authorization": f"Bearer {do_key}",
             "Content-Type": "application/json",
         }
+    else:
+        # Reasoning models (o1, o3, o4) use "developer" role instead of "system"
+        is_reasoning = any(deployment.startswith(p) or model.startswith(p) for p in ("o1", "o3", "o4"))
+        if is_reasoning:
+            messages = [
+                {"role": "developer" if m["role"] == "system" else m["role"], "content": m["content"]}
+                for m in messages
+            ]
+
+        if model_type == "google":
+            google_key = CONFIG.get("google_api_key", "")
+            if not google_key:
+                return "Error: No Google API key configured. Use configure tool to set google_api_key.", {}, 0
+            google_ep = _google_base_url()
+            if not google_ep:
+                return "Error: No Google project configured. Use configure tool to set google_project.", {}, 0
+            url = f"{google_ep}/chat/completions"
+            body = {
+                "messages": messages,
+                "model": f"google/{model}",
+                "max_tokens": max_tokens,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+            headers = {
+                "x-goog-api-key": google_key,
+                "Content-Type": "application/json",
+            }
+        elif model_type == "deployed":
+            if not api_key:
+                return "Error: No API key configured. Use configure tool to set api_key.", {}, 0
+            if not endpoint:
+                return "Error: No endpoint configured.", {}, 0
+            url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-12-01-preview"
+            body = {
+                "messages": messages,
+                "max_completion_tokens": max_tokens,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+            headers = {
+                "api-key": api_key,
+                "Content-Type": "application/json",
+            }
+        else:  # serverless
+            if not api_key:
+                return "Error: No API key configured. Use configure tool to set api_key.", {}, 0
+            if not endpoint:
+                return "Error: No endpoint configured.", {}, 0
+
+            # o1 and o4 models on serverless endpoints require a newer api-version
+            version = "2024-12-01-preview" if any(p in model.lower() for p in ("o1", "o4")) else "2024-05-01-preview"
+            url = f"{endpoint}/models/chat/completions?api-version={version}"
+            body = {
+                "messages": messages,
+                "model": model,
+                "max_tokens": max_tokens,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+            headers = {
+                "api-key": api_key,
+                "Content-Type": "application/json",
+            }
+
+    is_reasoning = model_type != "digitalocean" and any(deployment.startswith(p) or model.startswith(p) for p in ("o1", "o3", "o4"))
 
     if is_reasoning:
         body["reasoning_effort"] = CONFIG.get("reasoning_effort", "high")
@@ -840,6 +885,8 @@ async def multi_chat(client, user_message, models=None, progress_token=None):
 
     def _detect_model_type(model_name):
         ml = model_name.lower()
+        if model_name in DO_MODELS:
+            return "digitalocean"
         if "gemini" in ml:
             return "google"
         if model_name in BEDROCK_MODELS or "claude" in ml or "anthropic" in ml or "nova" in ml or "llama4" in ml:
@@ -949,7 +996,7 @@ TOOLS = [
                 "endpoint": {"type": "string"},
                 "deployment": {"type": "string"},
                 "model": {"type": "string"},
-                "model_type": {"type": "string", "enum": ["deployed", "serverless", "bedrock", "google"]},
+                "model_type": {"type": "string", "enum": ["deployed", "serverless", "bedrock", "google", "digitalocean"]},
                 "aws_access_key": {"type": "string", "description": "AWS Access Key ID for Bedrock."},
                 "aws_secret_key": {"type": "string", "description": "AWS Secret Access Key for Bedrock."},
                 "aws_region": {"type": "string", "description": "AWS region for Bedrock (default: us-east-1)."},
@@ -970,6 +1017,7 @@ TOOLS = [
                 "google_api_key": {"type": "string", "description": "Google Vertex AI API key for Gemini models."},
                 "google_project": {"type": "string", "description": "Google Cloud project ID or number."},
                 "google_region": {"type": "string", "description": "Vertex AI region (default: global)."},
+                "do_api_key": {"type": "string", "description": "DigitalOcean model access key for Serverless Inference."},
             },
         },
     },
@@ -1068,6 +1116,7 @@ async def handle_request(client, req):
 
 
 async def _run_tool(client, req_id, tool_name, args, progress_token):
+    global CURRENT_SESSION, _model_status
     if tool_name == "chat":
         message = args.get("message", "")
         if not message:
@@ -1092,7 +1141,6 @@ async def _run_tool(client, req_id, tool_name, args, progress_token):
         await _write_response(_result(req_id, res))
 
     elif tool_name == "reset":
-        global CURRENT_SESSION
         clear_session(CURRENT_SESSION)
         await _write_response(_result(req_id, f"History for session '{CURRENT_SESSION}' has been cleared."))
 
@@ -1161,7 +1209,6 @@ async def _run_tool(client, req_id, tool_name, args, progress_token):
             await _write_response(_result(req_id, f"Error deleting session: {e}"))
 
     elif tool_name == "status":
-        global _model_status
         if not _model_status:
             await _write_response(_result(req_id, "All models are currently in standby (no recent calls)."))
         else:
@@ -1199,11 +1246,12 @@ def _handle_configure(args):
         "conversation_max_turns", "voice", "default_models", "multi_chat_timeout",
         "google_api_key", "google_project", "google_region",
         "aws_access_key", "aws_secret_key", "aws_region",
+        "do_api_key",
     }
     updated = []
     for k, v in args.items():
         if k not in settable: continue
-        if k in ("api_key", "google_api_key", "aws_access_key", "aws_secret_key"): CONFIG[k] = str(v)
+        if k in ("api_key", "google_api_key", "aws_access_key", "aws_secret_key", "do_api_key"): CONFIG[k] = str(v)
         elif k == "endpoint": CONFIG[k] = str(v).rstrip("/")
         elif k in ("deployment", "model", "model_type", "system_prompt", "voice", "google_project", "google_region", "aws_region"): CONFIG[k] = str(v)
         elif k == "max_completion_tokens": CONFIG[k] = max(1, min(int(v), 128000))
@@ -1212,7 +1260,7 @@ def _handle_configure(args):
         elif k == "default_models": CONFIG[k] = list(v) if isinstance(v, list) else [str(v)]
         elif k == "multi_chat_timeout": CONFIG[k] = max(1, min(int(v), 120))
         else: CONFIG[k] = v
-        updated.append(f"{k}={CONFIG[k]}" if k not in ("api_key", "google_api_key", "aws_access_key", "aws_secret_key") else f"{k}=***{str(v)[-4:]}")
+        updated.append(f"{k}={CONFIG[k]}" if k not in ("api_key", "google_api_key", "aws_access_key", "aws_secret_key", "do_api_key") else f"{k}=***{str(v)[-4:]}")
 
     if updated:
         save_config()
@@ -1252,6 +1300,12 @@ def _handle_configure(args):
     lines.append(f"  secret_key:  ***{aws_secret[-4:]}" if aws_secret else "  secret_key:  (not set)")
     lines.append(f"  region:      {CONFIG.get('aws_region', 'us-east-1')}")
     lines.append(f"  models:      {', '.join(list(BEDROCK_MODELS.keys())[:5])}...")
+    lines.append("")
+    lines.append("[DigitalOcean]")
+    do_key = CONFIG.get("do_api_key", "")
+    lines.append(f"  api_key:     ***{do_key[-4:]}" if do_key else "  api_key:     (not set)")
+    lines.append(f"  endpoint:    {DO_ENDPOINT}")
+    lines.append(f"  models:      {', '.join(DO_MODELS[:5])}...")
     return "\n".join(lines)
 
 
@@ -1264,6 +1318,7 @@ async def _handle_models(client, args, progress_token):
     current_deployment = CONFIG.get("deployment", "")
     current_model = CONFIG.get("model", "")
     has_aws = CONFIG.get("aws_access_key") and CONFIG.get("aws_secret_key")
+    has_do = bool(CONFIG.get("do_api_key"))
 
     if do_test:
         # Parallel test all models for maximum speed
@@ -1283,12 +1338,16 @@ async def _handle_models(client, args, progress_token):
             for m in BEDROCK_MODELS.keys():
                 all_tests.append(_test_model(client, m, "bedrock"))
                 model_info.append((m, "bedrock", "AWS Bedrock"))
+        if has_do:
+            for m in DO_MODELS:
+                all_tests.append(_test_model(client, m, "digitalocean"))
+                model_info.append((m, "digitalocean", "DigitalOcean"))
 
         # Run all tests in parallel
         results = await asyncio.gather(*all_tests, return_exceptions=True)
 
         # Group results by section
-        sections = {"Azure Deployed": [], "Azure Serverless": [], "Google Vertex AI": [], "AWS Bedrock": []}
+        sections = {"Azure Deployed": [], "Azure Serverless": [], "Google Vertex AI": [], "AWS Bedrock": [], "DigitalOcean": []}
         for (name, mtype, section), result in zip(model_info, results):
             if isinstance(result, Exception):
                 status = "can deploy" if section == "Azure Deployed" else "unavailable"
@@ -1306,10 +1365,12 @@ async def _handle_models(client, args, progress_token):
                 sections[section].append(f"  {name}: {status}")
 
         lines = [f"Endpoint: {endpoint}\n"]
-        for section in ["Azure Deployed", "Azure Serverless", "Google Vertex AI", "AWS Bedrock"]:
+        for section in ["Azure Deployed", "Azure Serverless", "Google Vertex AI", "AWS Bedrock", "DigitalOcean"]:
             lines.append(f"[{section}]")
             if section == "AWS Bedrock" and not has_aws:
                 lines.append("  (set aws_access_key and aws_secret_key to enable)")
+            elif section == "DigitalOcean" and not has_do:
+                lines.append("  (set do_api_key to enable)")
             else:
                 lines.extend(sections[section])
             lines.append("")
@@ -1333,6 +1394,12 @@ async def _handle_models(client, args, progress_token):
             lines.append(f"  {m}")
     else:
         lines.append("  (set aws_access_key and aws_secret_key to enable)")
+    lines.append("\n[DigitalOcean]")
+    if has_do:
+        for m in DO_MODELS:
+            lines.append(f"  {m}")
+    else:
+        lines.append("  (set do_api_key to enable)")
     return "\n".join(lines)
 
 
@@ -1341,6 +1408,10 @@ async def _test_model(client, name, mtype):
         if mtype == "bedrock":
             messages = [{"role": "user", "content": "hi"}]
             return await call_bedrock(client, messages, None, name)
+        elif mtype == "digitalocean":
+            url = f"{DO_ENDPOINT}/chat/completions"
+            body = {"messages": [{"role": "user", "content": "hi"}], "model": name, "max_completion_tokens": 256}
+            headers = {"Authorization": f"Bearer {CONFIG.get('do_api_key', '')}", "Content-Type": "application/json"}
         elif mtype == "google":
             google_ep = _google_base_url()
             url = f"{google_ep}/chat/completions"
@@ -1378,6 +1449,7 @@ async def _handle_scan(client, progress_token):
 
     has_aws = CONFIG.get("aws_access_key") and CONFIG.get("aws_secret_key")
     has_google = CONFIG.get("google_api_key")
+    has_do = bool(CONFIG.get("do_api_key"))
 
     lines = ["## Model Availability Scan\n"]
     cli_info = []
@@ -1453,6 +1525,10 @@ async def _handle_scan(client, progress_token):
         for m in bedrock_to_test:
             all_tests.append(_test_model(client, m, "bedrock"))
             model_info.append((m, "bedrock", "AWS Bedrock", True))
+    if has_do:
+        for m in DO_MODELS:
+            all_tests.append(_test_model(client, m, "digitalocean"))
+            model_info.append((m, "digitalocean", "DigitalOcean", True))
 
     if progress_token:
         await _send_progress(progress_token, 0.15, f"Testing {len(all_tests)} models...")
@@ -1464,7 +1540,7 @@ async def _handle_scan(client, progress_token):
         await _send_progress(progress_token, 0.9, "Formatting results...")
 
     # Build table output
-    sections = {"Azure OpenAI": [], "Azure Serverless": [], "Google Gemini": [], "AWS Bedrock": []}
+    sections = {"Azure OpenAI": [], "Azure Serverless": [], "Google Gemini": [], "AWS Bedrock": [], "DigitalOcean": []}
     counts = {"pass": 0, "fail": 0, "deploy": 0, "deployed": 0}
 
     for (name, mtype, section, is_deployed), result in zip(model_info, results):
@@ -1494,12 +1570,14 @@ async def _handle_scan(client, progress_token):
     # Output CLI info
     lines.append("_" + " | ".join(cli_info) + "_\n")
 
-    for section in ["Azure OpenAI", "Azure Serverless", "Google Gemini", "AWS Bedrock"]:
+    for section in ["Azure OpenAI", "Azure Serverless", "Google Gemini", "AWS Bedrock", "DigitalOcean"]:
         if not sections[section]:
             if section == "Google Gemini" and not has_google:
                 lines.append(f"### {section}\n_(set google_api_key to enable)_\n")
             elif section == "AWS Bedrock" and not has_aws:
                 lines.append(f"### {section}\n_(set aws_access_key and aws_secret_key to enable)_\n")
+            elif section == "DigitalOcean" and not has_do:
+                lines.append(f"### {section}\n_(set do_api_key to enable)_\n")
             continue
         lines.append(f"### {section}")
         lines.append("| Model | Status |")
