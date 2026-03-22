@@ -1,11 +1,11 @@
 #!/bin/bash
-# Setup script for azure-chat-assistant MCP server
+# Setup script for cloud-chat-assistant MCP server
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_DIR="$HOME/.config/azure-chat-assistant"
+CONFIG_DIR="$HOME/.config/cloud-chat-assistant"
 
-echo "Setting up azure-chat-assistant..."
+echo "Setting up cloud-chat-assistant..."
 
 # Create venv and install dependencies
 if [ ! -d "$SCRIPT_DIR/venv" ]; then
@@ -44,12 +44,12 @@ fi
 
 # Print MCP registration snippet
 PYTHON_PATH="$SCRIPT_DIR/venv/bin/python3"
-SERVER_PATH="$SCRIPT_DIR/mcp_chat_assistant.py"
+SERVER_PATH="$SCRIPT_DIR/mcp_cloud_chat.py"
 
 echo ""
 echo "Setup complete! Add this to your ~/.claude.json mcpServers:"
 echo ""
-echo "    \"azure-chat-assistant\": {"
+echo "    \"cloud-chat-assistant\": {"
 echo "      \"type\": \"stdio\","
 echo "      \"command\": \"$PYTHON_PATH\","
 echo "      \"args\": [\"$SERVER_PATH\"],"

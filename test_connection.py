@@ -6,7 +6,7 @@ import os
 import time
 import urllib.request
 
-CONFIG_PATH = os.path.expanduser("~/.config/azure-chat-assistant/config.json")
+CONFIG_PATH = os.path.expanduser("~/.config/cloud-chat-assistant/config.json")
 
 
 def load_config():
