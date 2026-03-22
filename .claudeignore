@@ -1,4 +1,19 @@
+# Python
 venv/
 __pycache__/
 *.pyc
+
+# Data
 sessions.db
+
+# Secrets
+.env
+.mcp.json
+
+# Reference docs (not code)
+WISDOM_SCROLL.md
+FORWARD_GUIDE.md
+RESEARCH_AND_PLAN.md
+
+# Tooling
+.claude/
