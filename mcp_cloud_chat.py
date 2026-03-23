@@ -48,7 +48,8 @@ DEFAULTS = {
     "endpoint": "",
     "deployment": "gpt-5.3-chat",
     "model": "gpt-5.3-chat-2026-03-03",
-    "model_type": "deployed",       # "deployed" (OpenAI endpoint) or "serverless" (unified inference)
+    "model_type": "deployed",       # "deployed", "serverless", "codex", "bedrock", "google", "digitalocean", "puter"
+    "reasoning_effort": "medium",    # for codex/reasoning models: low, medium, high, xhigh
     "max_completion_tokens": 2048,
     "temperature": 1.0,
     "system_prompt": "You are a helpful chat assistant. Keep responses concise and conversational.",
@@ -415,7 +416,7 @@ def save_config():
         if k in DEFAULTS and CONFIG[k] == DEFAULTS[k]:
             continue
         disk[k] = v
-    for k in ("api_key", "endpoint", "deployment", "model", "model_type", "google_api_key", "google_project", "google_region", "aws_access_key", "aws_secret_key", "aws_region", "do_api_key", "puter_api_key"):
+    for k in ("api_key", "endpoint", "deployment", "model", "model_type", "reasoning_effort", "google_api_key", "google_project", "google_region", "aws_access_key", "aws_secret_key", "aws_region", "do_api_key", "puter_api_key"):
         disk[k] = CONFIG.get(k, "")
     # Always persist azure_endpoints (even if empty, for clarity)
     azure_eps = CONFIG.get("azure_endpoints", [])
@@ -575,6 +576,75 @@ async def call_bedrock(client: httpx.AsyncClient, messages, progress_token=None,
         return f"Error: {e}", {}, 0
 
 
+# ── Codex Responses API ────────────────────────────────────────────────────
+
+async def call_codex(client: httpx.AsyncClient, messages, progress_token, deployment, model):
+    """Call Azure OpenAI Codex model via the Responses API. Returns (response_text, usage_dict, latency_ms)."""
+    # Resolve endpoint via deployment map (multi-region) or primary
+    ep_info = _deployment_map.get(deployment)
+    ep = ep_info["endpoint"] if ep_info else CONFIG.get("endpoint", "")
+    key = ep_info["api_key"] if ep_info else CONFIG.get("api_key", "")
+
+    if not key or not ep:
+        return "Error: api_key and endpoint required for codex models.", {}, 0
+
+    # Responses API uses /openai/v1/responses (model in body)
+    url = f"{ep}/openai/v1/responses"
+
+    # Flatten messages into Responses API input format
+    input_items = []
+    for msg in messages:
+        role = msg["role"]
+        if role == "system":
+            input_items.append({"role": "developer", "content": msg["content"]})
+        else:
+            input_items.append({"role": role, "content": msg["content"]})
+
+    reasoning_effort = CONFIG.get("reasoning_effort", "medium")
+    body = {
+        "model": deployment,
+        "input": input_items,
+        "reasoning": {"effort": reasoning_effort},
+        "max_output_tokens": CONFIG.get("max_completion_tokens", 2048),
+    }
+
+    headers = {
+        "api-key": key,
+        "Content-Type": "application/json",
+    }
+
+    if progress_token:
+        await _send_progress(progress_token, 0.1, f"[{model}] Thinking (codex)...")
+
+    t0 = time.perf_counter()
+    try:
+        resp = await client.post(url, json=body, headers=headers, timeout=120.0)
+        latency = (time.perf_counter() - t0) * 1000
+
+        if resp.status_code == 200:
+            _model_status[model] = "OK"
+            data = resp.json()
+            # Extract text from Responses API output
+            response_text = ""
+            for item in data.get("output", []):
+                if item.get("type") == "message":
+                    for block in item.get("content", []):
+                        if block.get("type") == "output_text":
+                            response_text += block.get("text", "")
+            usage = data.get("usage", {})
+            if progress_token:
+                await _send_progress(progress_token, 1.0, f"[{model}] Done ({latency:.0f}ms)")
+            return response_text.strip() if response_text else "Error: No response from model.", usage, latency
+        elif resp.status_code == 429:
+            _model_status[model] = "Rate Limited"
+            return f"**[{model}]** Rate limit hit.", {}, 0
+        else:
+            _model_status[model] = f"Error {resp.status_code}"
+            return f"Error {resp.status_code}: {resp.text[:500]}", {}, latency
+    except Exception as e:
+        return f"Error: {e}", {}, 0
+
+
 # ── LLM call ────────────────────────────────────────────────────────────────
 
 async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, model_override=None, model_type_override=None):
@@ -592,6 +662,10 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
     # Route to Bedrock if model type is bedrock (use deployment for model name)
     if model_type == "bedrock":
         return await call_bedrock(client, messages, progress_token, deployment)
+
+    # Route to Codex Responses API
+    if model_type == "codex":
+        return await call_codex(client, messages, progress_token, deployment, model)
 
     # Route to Puter OpenAI-compatible endpoint
     if model_type == "puter":
@@ -952,6 +1026,8 @@ async def multi_chat(client, user_message, models=None, progress_token=None):
             return "google"
         if model_name in BEDROCK_MODELS or "claude" in ml or "anthropic" in ml or "nova" in ml or "llama4" in ml:
             return "bedrock"
+        if "codex" in ml:
+            return "codex"
         if any(p in ml for p in ("gpt", "o1", "o3", "o4")):
             return "deployed"
         return "serverless"
@@ -1057,12 +1133,13 @@ TOOLS = [
                 "endpoint": {"type": "string"},
                 "deployment": {"type": "string"},
                 "model": {"type": "string"},
-                "model_type": {"type": "string", "enum": ["deployed", "serverless", "bedrock", "google", "digitalocean", "puter"]},
+                "model_type": {"type": "string", "enum": ["deployed", "serverless", "codex", "bedrock", "google", "digitalocean", "puter"]},
                 "aws_access_key": {"type": "string", "description": "AWS Access Key ID for Bedrock."},
                 "aws_secret_key": {"type": "string", "description": "AWS Secret Access Key for Bedrock."},
                 "aws_region": {"type": "string", "description": "AWS region for Bedrock (default: us-east-1)."},
                 "max_completion_tokens": {"type": "integer"},
                 "temperature": {"type": "number"},
+                "reasoning_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh"], "description": "Reasoning effort for codex/reasoning models."},
                 "system_prompt": {"type": "string"},
                 "conversation_max_turns": {"type": "integer"},
                 "voice": {"type": "string"},
@@ -1317,7 +1394,7 @@ def _handle_configure(args):
     settable = {
         "api_key", "endpoint", "deployment", "model", "model_type",
         "max_completion_tokens", "temperature", "system_prompt",
-        "conversation_max_turns", "voice", "default_models", "multi_chat_timeout",
+        "conversation_max_turns", "voice", "default_models", "multi_chat_timeout", "reasoning_effort",
         "google_api_key", "google_project", "google_region",
         "aws_access_key", "aws_secret_key", "aws_region",
         "do_api_key", "puter_api_key", "azure_endpoints",
@@ -1327,7 +1404,7 @@ def _handle_configure(args):
         if k not in settable: continue
         if k in ("api_key", "google_api_key", "aws_access_key", "aws_secret_key", "do_api_key", "puter_api_key"): CONFIG[k] = str(v)
         elif k == "endpoint": CONFIG[k] = str(v).rstrip("/")
-        elif k in ("deployment", "model", "model_type", "system_prompt", "voice", "google_project", "google_region", "aws_region"): CONFIG[k] = str(v)
+        elif k in ("deployment", "model", "model_type", "system_prompt", "voice", "google_project", "google_region", "aws_region", "reasoning_effort"): CONFIG[k] = str(v)
         elif k == "max_completion_tokens": CONFIG[k] = max(1, min(int(v), 128000))
         elif k == "temperature": CONFIG[k] = max(0.0, min(float(v), 2.0))
         elif k == "conversation_max_turns": CONFIG[k] = max(1, min(int(v), 500))
@@ -1523,6 +1600,12 @@ async def _test_model(client, name, mtype, endpoint_override=None, api_key_overr
             url = f"{google_ep}/chat/completions"
             body = {"messages": [{"role": "user", "content": "hi"}], "model": f"google/{name}", "max_tokens": 10}
             headers = {"x-goog-api-key": CONFIG.get("google_api_key", ""), "Content-Type": "application/json"}
+        elif mtype == "codex":
+            ep = endpoint_override or CONFIG['endpoint']
+            key = api_key_override or CONFIG['api_key']
+            url = f"{ep}/openai/v1/responses"
+            body = {"model": name, "input": "Say hi in one word.", "reasoning": {"effort": "low"}, "max_output_tokens": 20}
+            headers = {"api-key": key, "Content-Type": "application/json"}
         elif mtype == "deployed":
             ep = endpoint_override or CONFIG['endpoint']
             key = api_key_override or CONFIG['api_key']
@@ -1537,10 +1620,20 @@ async def _test_model(client, name, mtype, endpoint_override=None, api_key_overr
             headers = {"api-key": key, "Content-Type": "application/json"}
 
         t0 = time.perf_counter()
-        resp = await client.post(url, json=body, headers=headers, timeout=15.0)
+        timeout = 30.0 if mtype == "codex" else 15.0
+        resp = await client.post(url, json=body, headers=headers, timeout=timeout)
         latency = (time.perf_counter() - t0) * 1000
         if resp.status_code != 200: return f"Error {resp.status_code}", {}, 0
         data = resp.json()
+        if mtype == "codex":
+            # Responses API output format
+            text = ""
+            for item in data.get("output", []):
+                if item.get("type") == "message":
+                    for block in item.get("content", []):
+                        if block.get("type") == "output_text":
+                            text += block.get("text", "")
+            return text or "OK", data.get("usage", {}), latency
         return data["choices"][0]["message"]["content"], data.get("usage", {}), latency
     except Exception as e:
         return f"Error: {e}", {}, 0
@@ -1642,12 +1735,16 @@ async def _handle_scan(client, progress_token):
     # For deployable-but-not-deployed, mark as "can deploy" without testing
     azure_deployed_models = all_deployable if all_deployable else set(AZURE_DEPLOYED)
 
+    # Codex models use the Responses API, not chat completions
+    _codex_patterns = ("codex",)
+
     for m in sorted(azure_deployed_models):
         if m in all_deployed:
             ep_info = all_deployed[m]
             rname = _endpoint_resource_name(ep_info["endpoint"])
-            all_tests.append(_test_model(client, m, "deployed", ep_info["endpoint"], ep_info["api_key"]))
-            model_info.append((m, "deployed", "Azure OpenAI", True, rname))
+            mtype = "codex" if any(p in m.lower() for p in _codex_patterns) else "deployed"
+            all_tests.append(_test_model(client, m, mtype, ep_info["endpoint"], ep_info["api_key"]))
+            model_info.append((m, mtype, "Azure OpenAI", True, rname))
         else:
             # Not deployed — skip testing, will mark as "can deploy"
             all_tests.append(asyncio.coroutine(lambda: ("not_deployed", {}, 0))() if False else None)
