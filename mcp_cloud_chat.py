@@ -67,6 +67,8 @@ DEFAULTS = {
     "do_api_key": "",
     # Puter
     "puter_api_key": "",
+    # Multi-region Azure: additional endpoints beyond the primary
+    "azure_endpoints": [],  # [{"endpoint": "https://...", "api_key": "..."}]
 }
 
 # ── Model Catalogs ──────────────────────────────────────────────────────────
@@ -179,21 +181,14 @@ async def _run_cli(cmd, timeout=30):
     except Exception:
         return None
 
-async def _az_list_deployable_models():
-    """Use Azure CLI to list deployable OpenAI models."""
+async def _az_list_deployable_models(endpoint=None):
+    """Use Azure CLI to list deployable OpenAI models for a given endpoint."""
     if not _cli_available("az"):
         return None
-    # Extract resource name from endpoint
-    endpoint = CONFIG.get("endpoint", "")
+    endpoint = endpoint or CONFIG.get("endpoint", "")
     if not endpoint:
         return None
-    # Endpoint format: https://<resource-name>.openai.azure.com or similar
-    try:
-        from urllib.parse import urlparse
-        host = urlparse(endpoint).hostname
-        resource_name = host.split(".")[0] if host else None
-    except Exception:
-        return None
+    resource_name = _endpoint_resource_name(endpoint)
     if not resource_name:
         return None
     # Get resource group (try env var first, then query Azure)
@@ -229,19 +224,14 @@ async def _az_list_deployable_models():
     except Exception:
         return None
 
-async def _az_list_deployed():
-    """Use Azure CLI to list currently deployed models."""
+async def _az_list_deployed(endpoint=None):
+    """Use Azure CLI to list currently deployed models for a given endpoint."""
     if not _cli_available("az"):
         return None
-    endpoint = CONFIG.get("endpoint", "")
+    endpoint = endpoint or CONFIG.get("endpoint", "")
     if not endpoint:
         return None
-    try:
-        from urllib.parse import urlparse
-        host = urlparse(endpoint).hostname
-        resource_name = host.split(".")[0] if host else None
-    except Exception:
-        return None
+    resource_name = _endpoint_resource_name(endpoint)
     if not resource_name:
         return None
     rg = os.environ.get("AZURE_RESOURCE_GROUP", "")
@@ -427,11 +417,43 @@ def save_config():
         disk[k] = v
     for k in ("api_key", "endpoint", "deployment", "model", "model_type", "google_api_key", "google_project", "google_region", "aws_access_key", "aws_secret_key", "aws_region", "do_api_key", "puter_api_key"):
         disk[k] = CONFIG.get(k, "")
+    # Always persist azure_endpoints (even if empty, for clarity)
+    azure_eps = CONFIG.get("azure_endpoints", [])
+    if azure_eps:
+        disk["azure_endpoints"] = azure_eps
     with open(CONFIG_PATH, "w") as f:
         json.dump(disk, f, indent=4)
 
 
 CONFIG = load_config()
+
+# Multi-region deployment routing: deployment_name -> {endpoint, api_key}
+_deployment_map = {}
+
+
+def _get_all_azure_endpoints():
+    """Return list of {endpoint, api_key} dicts for all configured Azure resources."""
+    endpoints = []
+    primary_ep = CONFIG.get("endpoint", "")
+    primary_key = CONFIG.get("api_key", "")
+    if primary_ep and primary_key:
+        endpoints.append({"endpoint": primary_ep, "api_key": primary_key})
+    for extra in CONFIG.get("azure_endpoints", []):
+        ep = extra.get("endpoint", "").rstrip("/")
+        key = extra.get("api_key", "")
+        if ep and key and ep != primary_ep:
+            endpoints.append({"endpoint": ep, "api_key": key})
+    return endpoints
+
+
+def _endpoint_resource_name(endpoint):
+    """Extract short resource name from Azure endpoint URL."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(endpoint).hostname
+        return host.split(".")[0] if host else endpoint
+    except Exception:
+        return endpoint
 
 
 def _google_base_url():
@@ -635,11 +657,15 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
                 "Content-Type": "application/json",
             }
         elif model_type == "deployed":
-            if not api_key:
+            # Multi-region: look up deployment map for the correct endpoint
+            ep_info = _deployment_map.get(deployment)
+            ep = ep_info["endpoint"] if ep_info else endpoint
+            key = ep_info["api_key"] if ep_info else api_key
+            if not key:
                 return "Error: No API key configured. Use configure tool to set api_key.", {}, 0
-            if not endpoint:
+            if not ep:
                 return "Error: No endpoint configured.", {}, 0
-            url = f"{endpoint}/openai/deployments/{deployment}/chat/completions?api-version=2024-12-01-preview"
+            url = f"{ep}/openai/deployments/{deployment}/chat/completions?api-version=2024-12-01-preview"
             body = {
                 "messages": messages,
                 "max_completion_tokens": max_tokens,
@@ -647,7 +673,7 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
                 "stream_options": {"include_usage": True},
             }
             headers = {
-                "api-key": api_key,
+                "api-key": key,
                 "Content-Type": "application/json",
             }
         else:  # serverless
@@ -1054,6 +1080,18 @@ TOOLS = [
                 "google_region": {"type": "string", "description": "Vertex AI region (default: global)."},
                 "do_api_key": {"type": "string", "description": "DigitalOcean model access key for Serverless Inference."},
                 "puter_api_key": {"type": "string", "description": "Puter auth token for OpenAI-compatible AI endpoint."},
+                "azure_endpoints": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "endpoint": {"type": "string"},
+                            "api_key": {"type": "string"},
+                        },
+                        "required": ["endpoint", "api_key"],
+                    },
+                    "description": "Additional Azure AI endpoints for multi-region support. Each entry is {endpoint, api_key}.",
+                },
             },
         },
     },
@@ -1282,7 +1320,7 @@ def _handle_configure(args):
         "conversation_max_turns", "voice", "default_models", "multi_chat_timeout",
         "google_api_key", "google_project", "google_region",
         "aws_access_key", "aws_secret_key", "aws_region",
-        "do_api_key", "puter_api_key",
+        "do_api_key", "puter_api_key", "azure_endpoints",
     }
     updated = []
     for k, v in args.items():
@@ -1295,8 +1333,20 @@ def _handle_configure(args):
         elif k == "conversation_max_turns": CONFIG[k] = max(1, min(int(v), 500))
         elif k == "default_models": CONFIG[k] = list(v) if isinstance(v, list) else [str(v)]
         elif k == "multi_chat_timeout": CONFIG[k] = max(1, min(int(v), 120))
+        elif k == "azure_endpoints":
+            # Validate and normalize endpoint entries
+            eps = []
+            for entry in (v if isinstance(v, list) else []):
+                if isinstance(entry, dict) and entry.get("endpoint") and entry.get("api_key"):
+                    eps.append({"endpoint": str(entry["endpoint"]).rstrip("/"), "api_key": str(entry["api_key"])})
+            CONFIG[k] = eps
         else: CONFIG[k] = v
-        updated.append(f"{k}={CONFIG[k]}" if k not in ("api_key", "google_api_key", "aws_access_key", "aws_secret_key", "do_api_key", "puter_api_key") else f"{k}=***{str(v)[-4:]}")
+        if k == "azure_endpoints":
+            updated.append(f"azure_endpoints=[{len(CONFIG[k])} endpoint(s)]")
+        elif k not in ("api_key", "google_api_key", "aws_access_key", "aws_secret_key", "do_api_key", "puter_api_key"):
+            updated.append(f"{k}={CONFIG[k]}")
+        else:
+            updated.append(f"{k}=***{str(v)[-4:]}")
 
     if updated:
         save_config()
@@ -1305,6 +1355,12 @@ def _handle_configure(args):
     lines = ["[Azure AI]"]
     lines.append(f"  endpoint:    {CONFIG.get('endpoint', '')}")
     lines.append(f"  api_key:     ***{CONFIG.get('api_key', '')[-4:]}" if CONFIG.get("api_key") else "  api_key:     (not set)")
+    extra_eps = CONFIG.get("azure_endpoints", [])
+    if extra_eps:
+        lines.append(f"  + {len(extra_eps)} additional endpoint(s):")
+        for ep in extra_eps:
+            rname = _endpoint_resource_name(ep.get("endpoint", ""))
+            lines.append(f"    - {rname}: ***{ep.get('api_key', '')[-4:]}")
     lines.append(f"  deployment:  {CONFIG.get('deployment', '')}")
     lines.append(f"  model:       {CONFIG.get('model', '')}")
     lines.append(f"  model_type:  {CONFIG.get('model_type', '')}")
@@ -1368,7 +1424,11 @@ async def _handle_models(client, args, progress_token):
         model_info = []  # (name, type, section)
 
         for m in AZURE_DEPLOYED:
-            all_tests.append(_test_model(client, m, "deployed"))
+            ep_info = _deployment_map.get(m)
+            if ep_info:
+                all_tests.append(_test_model(client, m, "deployed", ep_info["endpoint"], ep_info["api_key"]))
+            else:
+                all_tests.append(_test_model(client, m, "deployed"))
             model_info.append((m, "deployed", "Azure Deployed"))
         for m in AZURE_SERVERLESS:
             all_tests.append(_test_model(client, m, "serverless"))
@@ -1445,7 +1505,7 @@ async def _handle_models(client, args, progress_token):
     return "\n".join(lines)
 
 
-async def _test_model(client, name, mtype):
+async def _test_model(client, name, mtype, endpoint_override=None, api_key_override=None):
     try:
         if mtype == "bedrock":
             messages = [{"role": "user", "content": "hi"}]
@@ -1464,13 +1524,17 @@ async def _test_model(client, name, mtype):
             body = {"messages": [{"role": "user", "content": "hi"}], "model": f"google/{name}", "max_tokens": 10}
             headers = {"x-goog-api-key": CONFIG.get("google_api_key", ""), "Content-Type": "application/json"}
         elif mtype == "deployed":
-            url = f"{CONFIG['endpoint']}/openai/deployments/{name}/chat/completions?api-version=2024-12-01-preview"
+            ep = endpoint_override or CONFIG['endpoint']
+            key = api_key_override or CONFIG['api_key']
+            url = f"{ep}/openai/deployments/{name}/chat/completions?api-version=2024-12-01-preview"
             body = {"messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 10}
-            headers = {"api-key": CONFIG["api_key"], "Content-Type": "application/json"}
+            headers = {"api-key": key, "Content-Type": "application/json"}
         else:
-            url = f"{CONFIG['endpoint']}/models/chat/completions?api-version=2024-05-01-preview"
+            ep = endpoint_override or CONFIG['endpoint']
+            key = api_key_override or CONFIG['api_key']
+            url = f"{ep}/models/chat/completions?api-version=2024-05-01-preview"
             body = {"messages": [{"role": "user", "content": "hi"}], "model": name, "max_tokens": 10}
-            headers = {"api-key": CONFIG["api_key"], "Content-Type": "application/json"}
+            headers = {"api-key": key, "Content-Type": "application/json"}
 
         t0 = time.perf_counter()
         resp = await client.post(url, json=body, headers=headers, timeout=15.0)
@@ -1483,14 +1547,15 @@ async def _test_model(client, name, mtype):
 
 
 async def _handle_scan(client, progress_token):
-    """Scan all models and return a formatted availability matrix.
+    """Scan all models across all configured Azure endpoints and other providers.
 
     Uses CLI tools (az, aws, gcloud) for dynamic discovery when available,
-    falls back to hardcoded lists otherwise.
+    falls back to hardcoded lists otherwise. Supports multi-region Azure scanning.
     """
-    api_key = CONFIG.get("api_key", "")
-    endpoint = CONFIG.get("endpoint", "")
-    if not api_key or not endpoint:
+    global _deployment_map
+
+    azure_eps = _get_all_azure_endpoints()
+    if not azure_eps:
         return "Error: api_key and endpoint required. Use configure tool to set them."
 
     has_aws = CONFIG.get("aws_access_key") and CONFIG.get("aws_secret_key")
@@ -1507,41 +1572,59 @@ async def _handle_scan(client, progress_token):
     cli_info.append(f"CLIs: az={'yes' if has_az else 'no'}, aws={'yes' if has_aws_cli else 'no'}, gcloud={'yes' if has_gcloud else 'no'}")
 
     if progress_token:
-        await _send_progress(progress_token, 0.05, "Discovering models via CLI...")
+        await _send_progress(progress_token, 0.05, f"Discovering models across {len(azure_eps)} Azure endpoint(s)...")
 
-    # Dynamic model discovery
-    az_deployable = None
-    az_deployed = None
+    # ── Multi-region Azure discovery ──
+    # Per-endpoint: {endpoint -> {deployable: [...], deployed: [...]}}
+    ep_discovery = {}
+    all_deployable = set()
+    all_deployed = {}  # model_name -> ep_info
     bedrock_models = None
 
-    # Run CLI queries in parallel
+    # Build CLI tasks across all Azure endpoints + Bedrock
     cli_tasks = []
     if has_az:
-        cli_tasks.append(("az_deployable", _az_list_deployable_models()))
-        cli_tasks.append(("az_deployed", _az_list_deployed()))
+        for ep_info in azure_eps:
+            ep = ep_info["endpoint"]
+            rname = _endpoint_resource_name(ep)
+            cli_tasks.append((f"deployable:{rname}", _az_list_deployable_models(ep), ep_info))
+            cli_tasks.append((f"deployed:{rname}", _az_list_deployed(ep), ep_info))
     if has_aws_cli and has_aws:
-        cli_tasks.append(("bedrock", _aws_list_bedrock_models()))
+        cli_tasks.append(("bedrock", _aws_list_bedrock_models(), None))
 
     if cli_tasks:
         cli_results = await asyncio.gather(*[t[1] for t in cli_tasks], return_exceptions=True)
-        for (name, _), result in zip(cli_tasks, cli_results):
-            if isinstance(result, Exception):
+        for (task_name, _, ep_info), result in zip(cli_tasks, cli_results):
+            if isinstance(result, Exception) or result is None:
                 continue
-            if name == "az_deployable":
-                az_deployable = result
-            elif name == "az_deployed":
-                az_deployed = result
-            elif name == "bedrock":
+            if task_name.startswith("deployable:"):
+                rname = task_name.split(":", 1)[1]
+                ep_discovery.setdefault(rname, {})["deployable"] = result
+                all_deployable.update(result)
+            elif task_name.startswith("deployed:"):
+                rname = task_name.split(":", 1)[1]
+                ep_discovery.setdefault(rname, {})["deployed"] = result
+                for m in result:
+                    all_deployed[m] = ep_info
+            elif task_name == "bedrock":
                 bedrock_models = result
 
-    # Build model lists with dynamic discovery fallback
-    azure_deployed_models = az_deployable if az_deployable else AZURE_DEPLOYED
-    already_deployed = set(az_deployed) if az_deployed else set()
+    # Populate deployment map for routing
+    _deployment_map = dict(all_deployed)
 
-    if az_deployable:
-        cli_info.append(f"Azure: {len(az_deployable)} deployable models from CLI, {len(already_deployed)} deployed")
+    # Summary info
+    total_deployed = len(all_deployed)
+    if has_az and ep_discovery:
+        ep_summaries = []
+        for rname, info in ep_discovery.items():
+            n_dep = len(info.get("deployed", []))
+            n_avail = len(info.get("deployable", []))
+            ep_summaries.append(f"{rname}: {n_avail} deployable, {n_dep} deployed")
+        cli_info.append(f"Azure endpoints: {' | '.join(ep_summaries)}")
+    elif has_az:
+        cli_info.append("Azure: CLI available but no models discovered")
     else:
-        cli_info.append("Azure: using hardcoded model list (az CLI not available or auth failed)")
+        cli_info.append("Azure: using hardcoded model list (az CLI not available)")
 
     if bedrock_models:
         cli_info.append(f"Bedrock: {len(bedrock_models)} models from CLI")
@@ -1549,48 +1632,76 @@ async def _handle_scan(client, progress_token):
         cli_info.append("Bedrock: using hardcoded model list")
 
     if progress_token:
-        await _send_progress(progress_token, 0.1, f"Testing models...")
+        await _send_progress(progress_token, 0.1, "Testing models...")
 
-    # Build test tasks
+    # ── Build test tasks ──
     all_tests = []
-    model_info = []  # (name, type, section, is_deployed)
+    model_info = []  # (name, type, section, is_deployed, resource_name)
 
-    for m in azure_deployed_models:
-        all_tests.append(_test_model(client, m, "deployed"))
-        model_info.append((m, "deployed", "Azure OpenAI", m in already_deployed))
+    # Azure deployed models: only test actually-deployed models against their endpoint
+    # For deployable-but-not-deployed, mark as "can deploy" without testing
+    azure_deployed_models = all_deployable if all_deployable else set(AZURE_DEPLOYED)
+
+    for m in sorted(azure_deployed_models):
+        if m in all_deployed:
+            ep_info = all_deployed[m]
+            rname = _endpoint_resource_name(ep_info["endpoint"])
+            all_tests.append(_test_model(client, m, "deployed", ep_info["endpoint"], ep_info["api_key"]))
+            model_info.append((m, "deployed", "Azure OpenAI", True, rname))
+        else:
+            # Not deployed — skip testing, will mark as "can deploy"
+            all_tests.append(asyncio.coroutine(lambda: ("not_deployed", {}, 0))() if False else None)
+            model_info.append((m, "deployed", "Azure OpenAI", False, None))
+
+    # Azure serverless — test against primary endpoint
+    primary_ep = azure_eps[0]
     for m in AZURE_SERVERLESS:
-        all_tests.append(_test_model(client, m, "serverless"))
-        model_info.append((m, "serverless", "Azure Serverless", True))
+        all_tests.append(_test_model(client, m, "serverless", primary_ep["endpoint"], primary_ep["api_key"]))
+        model_info.append((m, "serverless", "Azure Serverless", True, None))
+
     if has_google:
         for m in GOOGLE_MODELS:
             all_tests.append(_test_model(client, m, "google"))
-            model_info.append((m, "google", "Google Gemini", True))
+            model_info.append((m, "google", "Google Gemini", True, None))
     if has_aws:
-        # Use CLI-discovered Bedrock models or fall back to hardcoded
-        bedrock_to_test = list(BEDROCK_MODELS.keys())  # Always use friendly names
-        for m in bedrock_to_test:
+        for m in BEDROCK_MODELS.keys():
             all_tests.append(_test_model(client, m, "bedrock"))
-            model_info.append((m, "bedrock", "AWS Bedrock", True))
+            model_info.append((m, "bedrock", "AWS Bedrock", True, None))
     if has_do:
         for m in DO_MODELS:
             all_tests.append(_test_model(client, m, "digitalocean"))
-            model_info.append((m, "digitalocean", "DigitalOcean", True))
+            model_info.append((m, "digitalocean", "DigitalOcean", True, None))
+
+    # Filter out None entries (non-deployed models that we skip testing)
+    test_indices = [i for i, t in enumerate(all_tests) if t is not None]
+    actual_tests = [all_tests[i] for i in test_indices]
 
     if progress_token:
-        await _send_progress(progress_token, 0.15, f"Testing {len(all_tests)} models...")
+        await _send_progress(progress_token, 0.15, f"Testing {len(actual_tests)} models...")
 
     # Run all tests in parallel
-    results = await asyncio.gather(*all_tests, return_exceptions=True)
+    actual_results = await asyncio.gather(*actual_tests, return_exceptions=True)
+
+    # Map results back to full index
+    results = [None] * len(all_tests)
+    for idx, result in zip(test_indices, actual_results):
+        results[idx] = result
 
     if progress_token:
         await _send_progress(progress_token, 0.9, "Formatting results...")
 
-    # Build table output
+    # ── Build table output ──
     sections = {"Azure OpenAI": [], "Azure Serverless": [], "Google Gemini": [], "AWS Bedrock": [], "DigitalOcean": []}
     counts = {"pass": 0, "fail": 0, "deploy": 0, "deployed": 0}
 
-    for (name, mtype, section, is_deployed), result in zip(model_info, results):
-        if isinstance(result, Exception):
+    for i, (name, mtype, section, is_deployed, rname) in enumerate(model_info):
+        result = results[i]
+
+        if result is None:
+            # Non-deployed model, skipped testing
+            status = "can deploy"
+            counts["deploy"] += 1
+        elif isinstance(result, Exception):
             if section == "Azure OpenAI" and not is_deployed:
                 status = "can deploy"
                 counts["deploy"] += 1
@@ -1611,7 +1722,13 @@ async def _handle_scan(client, progress_token):
                 counts["pass"] += 1
                 if section == "Azure OpenAI" and is_deployed:
                     counts["deployed"] += 1
-        sections[section].append(f"| {name:<40} | {status:<15} |")
+
+        # Annotate with resource name for deployed models on non-primary endpoints
+        display_name = name
+        if rname and len(azure_eps) > 1:
+            display_name = f"{name} ({rname})"
+
+        sections[section].append(f"| {display_name:<50} | {status:<15} |")
 
     # Output CLI info
     lines.append("_" + " | ".join(cli_info) + "_\n")
