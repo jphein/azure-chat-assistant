@@ -19,7 +19,6 @@ Tools:
 
 import asyncio
 import hashlib
-import hmac
 import json
 import os
 import shutil
@@ -27,9 +26,16 @@ import subprocess
 import sys
 import time
 import sqlite3
-from datetime import datetime, timezone
 from urllib.parse import quote, urlparse
 import httpx
+
+from llm_stream import (
+    astream_chat,
+    resolve_model,
+    BEDROCK_MODELS,
+    _aws_sign_v4,
+    _get_bedrock_model_id,
+)
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -140,26 +146,7 @@ PUTER_MODELS = [
 ]
 PUTER_ENDPOINT = "https://api.puter.com/puterai/openai/v1"
 
-# AWS Bedrock model IDs (cross-region inference profiles)
-BEDROCK_MODELS = {
-    # Anthropic Claude 4.x
-    "claude-opus-4.5": "us.anthropic.claude-opus-4-5-20251101-v1:0",
-    "claude-opus-4.6": "us.anthropic.claude-opus-4-6-v1",
-    "claude-sonnet-4": "us.anthropic.claude-sonnet-4-20250514-v1:0",
-    "claude-sonnet-4.5": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-    "claude-sonnet-4.6": "us.anthropic.claude-sonnet-4-6",
-    "claude-haiku-4.5": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    # Amazon Nova
-    "nova-pro": "us.amazon.nova-pro-v1:0",
-    "nova-lite": "us.amazon.nova-lite-v1:0",
-    "nova-2-lite": "us.amazon.nova-2-lite-v1:0",
-    # Meta Llama 4
-    "llama4-maverick-17b": "us.meta.llama4-maverick-17b-instruct-v1:0",
-    "llama4-scout-17b": "us.meta.llama4-scout-17b-instruct-v1:0",
-    # Writer
-    "palmyra-x4": "us.writer.palmyra-x4-v1:0",
-    "palmyra-x5": "us.writer.palmyra-x5-v1:0",
-}
+# BEDROCK_MODELS imported from llm_stream (single source of truth)
 
 # ── CLI Helpers ────────────────────────────────────────────────────────────
 
@@ -467,55 +454,18 @@ def _google_base_url():
 
 
 # ── AWS SigV4 Signing ───────────────────────────────────────────────────────
+# _aws_sign_v4 and _get_bedrock_model_id imported from llm_stream.
+# Thin wrapper preserves the original call signature for call_bedrock().
 
 def _aws_sign(method, url, headers, payload, region, service="bedrock"):
-    """Sign an AWS request using Signature Version 4."""
+    """Sign an AWS request using Signature Version 4 (delegates to llm_stream)."""
     access_key = CONFIG.get("aws_access_key", "")
     secret_key = CONFIG.get("aws_secret_key", "")
     if not access_key or not secret_key:
         return headers
-
-    parsed = urlparse(url)
-    host = parsed.netloc
-    uri = parsed.path or "/"
-
-    t = datetime.now(timezone.utc)
-    amz_date = t.strftime("%Y%m%dT%H%M%SZ")
-    date_stamp = t.strftime("%Y%m%d")
-
-    canonical_uri = quote(uri, safe="/-_.~")
-    headers_to_sign = {"host": host, "x-amz-date": amz_date, "content-type": "application/json"}
-    signed_headers = ";".join(sorted(headers_to_sign.keys()))
-    canonical_headers = "".join(f"{k}:{v}\n" for k, v in sorted(headers_to_sign.items()))
-    payload_hash = hashlib.sha256(payload.encode() if isinstance(payload, str) else payload).hexdigest()
-
-    canonical_request = f"{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-
-    algorithm = "AWS4-HMAC-SHA256"
-    credential_scope = f"{date_stamp}/{region}/{service}/aws4_request"
-    string_to_sign = f"{algorithm}\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode()).hexdigest()}"
-
-    def sign(key, msg):
-        return hmac.new(key, msg.encode(), hashlib.sha256).digest()
-
-    k_date = sign(f"AWS4{secret_key}".encode(), date_stamp)
-    k_region = sign(k_date, region)
-    k_service = sign(k_region, service)
-    k_signing = sign(k_service, "aws4_request")
-    signature = hmac.new(k_signing, string_to_sign.encode(), hashlib.sha256).hexdigest()
-
-    authorization = f"{algorithm} Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
-
-    return {**headers, "host": host, "x-amz-date": amz_date, "authorization": authorization, "content-type": "application/json"}
-
-
-def _get_bedrock_model_id(model_name):
-    """Convert friendly model name to Bedrock model ID."""
-    if model_name in BEDROCK_MODELS:
-        return BEDROCK_MODELS[model_name]
-    if "." in model_name or ":" in model_name:
-        return model_name
-    return None
+    payload_bytes = payload.encode() if isinstance(payload, str) else payload
+    signed = _aws_sign_v4(method, url, payload_bytes, access_key, secret_key, region, service)
+    return {**headers, **signed}
 
 
 async def call_bedrock(client: httpx.AsyncClient, messages, progress_token=None, model_name="claude-opus-4.5"):
@@ -574,6 +524,17 @@ async def call_bedrock(client: httpx.AsyncClient, messages, progress_token=None,
             return f"Error {resp.status_code}: {resp.text[:300]}", {}, 0
     except Exception as e:
         return f"Error: {e}", {}, 0
+
+
+# ── Streaming Bedrock via llm_stream ───────────────────────────────────────
+
+async def call_bedrock_stream(client, messages, model_name="claude-opus-4.6"):
+    """Streaming Bedrock call via llm_stream. Yields text tokens."""
+    config = {k: CONFIG.get(k) for k in ("aws_access_key", "aws_secret_key", "aws_region")}
+    config["max_tokens"] = CONFIG.get("max_completion_tokens", 2048)
+    config["temperature"] = CONFIG.get("temperature", 1.0)
+    async for token in astream_chat("bedrock", model_name, messages, config=config):
+        yield token
 
 
 # ── Codex Responses API ────────────────────────────────────────────────────
