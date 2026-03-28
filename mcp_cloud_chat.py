@@ -61,7 +61,7 @@ DEFAULTS = {
     "system_prompt": "You are a helpful chat assistant. Keep responses concise and conversational.",
     "conversation_max_turns": 50,    # max history turns before auto-trimming
     "voice": "",                     # default TTS voice (empty = use speech config)
-    "default_models": ["gpt-5.3-chat", "Meta-Llama-3.1-405B-Instruct", "Phi-4"],  # models for multi_chat when none specified
+    "default_models": ["gpt-5.3-chat", "o4-mini", "grok-3", "DeepSeek-R1", "claude-sonnet-4.6", "gemini-3.1-pro-preview"],  # models for multi_chat when none specified
     "multi_chat_timeout": 15,        # per-model timeout in seconds for multi_chat
     "google_api_key": "",
     "google_project": "",
@@ -578,13 +578,38 @@ async def call_codex(client: httpx.AsyncClient, messages, progress_token, deploy
         await _send_progress(progress_token, 0.1, f"[{model}] Thinking (codex)...")
 
     t0 = time.perf_counter()
+
+    # Heartbeat ticker — keeps MCP client alive during long reasoning calls
+    async def _heartbeat():
+        pct = 0.15
+        while pct < 0.9:
+            await asyncio.sleep(5)
+            pct = min(pct + 0.05, 0.9)
+            elapsed = (time.perf_counter() - t0)
+            if progress_token:
+                await _send_progress(progress_token, pct, f"[{model}] Reasoning... ({elapsed:.0f}s)")
+    heartbeat = asyncio.create_task(_heartbeat()) if progress_token else None
+
     try:
-        resp = await client.post(url, json=body, headers=headers, timeout=120.0)
+        resp = await client.post(url, json=body, headers=headers, timeout=300.0)
         latency = (time.perf_counter() - t0) * 1000
 
+        # If 404 on primary, try other endpoints
+        if resp.status_code == 404:
+            fallback = await _try_endpoints_codex(client, deployment, model, messages, progress_token)
+            if fallback:
+                resp, _ = fallback
+                latency = (time.perf_counter() - t0) * 1000
+
         if resp.status_code == 200:
-            _model_status[model] = "OK"
             data = resp.json()
+            # Check for API-level error in response body
+            if data.get("error"):
+                err = data["error"]
+                err_msg = err.get("message", "") if isinstance(err, dict) else str(err)
+                _model_status[model] = f"Error"
+                return f"Error: {err_msg}", {}, latency
+            _model_status[model] = "OK"
             # Extract text from Responses API output
             response_text = ""
             for item in data.get("output", []):
@@ -603,7 +628,77 @@ async def call_codex(client: httpx.AsyncClient, messages, progress_token, deploy
             _model_status[model] = f"Error {resp.status_code}"
             return f"Error {resp.status_code}: {resp.text[:500]}", {}, latency
     except Exception as e:
-        return f"Error: {e}", {}, 0
+        return f"Error ({type(e).__name__}): {e}" if str(e) else f"Error: {type(e).__name__} (no details)", {}, 0
+    finally:
+        if heartbeat:
+            heartbeat.cancel()
+
+
+# ── Multi-endpoint fallback ────────────────────────────────────────────────
+
+async def _try_endpoints_deployed(client, deployment, messages, body_builder, timeout=120.0):
+    """Try a deployed model across all Azure endpoints. Returns (resp, endpoint_info) or None."""
+    endpoints = _get_all_azure_endpoints()
+    for ep_info in endpoints:
+        ep, key = ep_info["endpoint"], ep_info["api_key"]
+        url = f"{ep}/openai/deployments/{deployment}/chat/completions?api-version=2024-12-01-preview"
+        headers = {"api-key": key, "Content-Type": "application/json"}
+        body = body_builder()
+        try:
+            resp = await client.post(url, json=body, headers=headers, timeout=timeout)
+            if resp.status_code != 404:
+                # Cache this endpoint for future calls
+                _deployment_map[deployment] = ep_info
+                return resp, ep_info
+        except Exception:
+            continue
+    return None
+
+async def _try_endpoints_serverless(client, model, messages, body_builder, timeout=120.0):
+    """Try a serverless model across all Azure endpoints. Returns (resp, endpoint_info) or None."""
+    endpoints = _get_all_azure_endpoints()
+    version = "2024-12-01-preview" if any(p in model.lower() for p in ("o1", "o4")) else "2024-05-01-preview"
+    for ep_info in endpoints:
+        ep, key = ep_info["endpoint"], ep_info["api_key"]
+        url = f"{ep}/models/chat/completions?api-version={version}"
+        headers = {"api-key": key, "Content-Type": "application/json"}
+        body = body_builder()
+        try:
+            resp = await client.post(url, json=body, headers=headers, timeout=timeout)
+            if resp.status_code != 404 and resp.status_code != 400:
+                return resp, ep_info
+        except Exception:
+            continue
+    return None
+
+async def _try_endpoints_codex(client, deployment, model, messages, progress_token=None):
+    """Try a codex/responses-API model across all Azure endpoints."""
+    endpoints = _get_all_azure_endpoints()
+    input_items = []
+    for msg in messages:
+        role = "developer" if msg["role"] == "system" else msg["role"]
+        input_items.append({"role": role, "content": msg["content"]})
+
+    reasoning_effort = CONFIG.get("reasoning_effort", "medium")
+    body = {
+        "model": deployment,
+        "input": input_items,
+        "reasoning": {"effort": reasoning_effort},
+        "max_output_tokens": CONFIG.get("max_completion_tokens", 2048),
+    }
+
+    for ep_info in endpoints:
+        ep, key = ep_info["endpoint"], ep_info["api_key"]
+        url = f"{ep}/openai/v1/responses"
+        headers = {"api-key": key, "Content-Type": "application/json"}
+        try:
+            resp = await client.post(url, json=body, headers=headers, timeout=120.0)
+            if resp.status_code != 404:
+                _deployment_map[deployment] = ep_info
+                return resp, ep_info
+        except Exception:
+            continue
+    return None
 
 
 # ── LLM call ────────────────────────────────────────────────────────────────
@@ -752,6 +847,15 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
         try:
             resp = await client.post(url, json=body, headers=headers, timeout=120.0)
             latency = (time.perf_counter() - t0) * 1000
+
+            # Endpoint fallback on 404 — model may be on a secondary Azure endpoint
+            if resp.status_code == 404 and model_type in ("deployed", "serverless"):
+                fb_fn = _try_endpoints_deployed if model_type == "deployed" else _try_endpoints_serverless
+                fb = await fb_fn(client, deployment, messages, lambda: body, timeout=120.0)
+                if fb:
+                    resp, _ = fb
+                    latency = (time.perf_counter() - t0) * 1000
+
             if resp.status_code == 429:
                 _model_status[model] = "Rate Limited"
                 return f"**[{model}]** is currently resting (Rate Limit hit).", {}, 0
@@ -795,6 +899,11 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
                     body_text = await resp.aread()
                     _model_status[model] = "Error 400"
                     state["error"] = f"**[{model}]** Error 400: {body_text.decode()[:500]}"
+                    await queue.put(SENTINEL)
+                    return
+                elif resp.status_code == 404 and model_type in ("deployed", "serverless"):
+                    # Model not on this endpoint — mark for fallback retry
+                    state["error"] = "_FALLBACK_404_"
                     await queue.put(SENTINEL)
                     return
                 else:
@@ -854,10 +963,27 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
     await asyncio.gather(producer(), consumer())
 
     latency = (time.perf_counter() - t0) * 1000
-    
+
+    # Streaming 404 fallback — retry across all Azure endpoints
+    if state["error"] == "_FALLBACK_404_":
+        fb_fn = _try_endpoints_deployed if model_type == "deployed" else _try_endpoints_serverless
+        fb = await fb_fn(client, deployment if model_type == "deployed" else model, messages, lambda: body)
+        if fb:
+            resp, ep_info = fb
+            latency = (time.perf_counter() - t0) * 1000
+            if resp.status_code == 200:
+                data = resp.json()
+                _model_status[model] = "OK"
+                text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                usage = data.get("usage", {})
+                return text if text else "Error: No response from model.", usage, latency
+            else:
+                return f"Error {resp.status_code}: {resp.text[:500]}", {}, latency
+        return f"Error 404: Model '{deployment}' not found on any configured Azure endpoint.", {}, 0
+
     if state["error"]:
         return state["error"], {}, 0
-        
+
     if not state["full_text"]:
         return "Error: No response from model.", state["usage"], latency
 
@@ -985,9 +1111,10 @@ async def multi_chat(client, user_message, models=None, progress_token=None):
             return "puter"
         if "gemini" in ml:
             return "google"
-        if model_name in BEDROCK_MODELS or "claude" in ml or "anthropic" in ml or "nova" in ml or "llama4" in ml:
+        if model_name in BEDROCK_MODELS or "claude" in ml or "anthropic" in ml or "nova" in ml or "llama4" in ml or "palmyra" in ml:
             return "bedrock"
-        if "codex" in ml:
+        # Responses API models (codex, deep-research, pro reasoning)
+        if "codex" in ml or "deep-research" in ml or ml in ("gpt-5.4-pro",):
             return "codex"
         if any(p in ml for p in ("gpt", "o1", "o3", "o4")):
             return "deployed"
@@ -1066,10 +1193,11 @@ TOOLS = [
             "If models is omitted, uses the configured default_models list. "
             "Each response includes per-model latency and a wall-time summary. "
             "Slow models are skipped after the configured timeout (default 15s). "
-            "VOICE FLOW: To read responses aloud, pass the output to multi_speak with these voice assignments: "
-            "gpt-5.3-chat→en-US-DavisNeural, Meta-Llama-3.1-405B-Instruct→en-US-AndrewNeural, "
-            "DeepSeek-R1→en-US-BrianNeural, Phi-4→en-US-JennyNeural. "
-            "Claude (the caller) uses en-US-AvaNeural."
+            "VOICE FLOW: To read responses aloud, pass output to multi_speak with voice assignments by family: "
+            "OpenAI (gpt-5.x, o1, o4)→en-US-DavisNeural, Claude→en-US-AvaNeural, "
+            "Llama→en-US-AndrewNeural, DeepSeek→en-US-BrianNeural, Grok→en-US-GuyNeural, "
+            "Gemini→en-US-AriaNeural, Cohere→en-US-JennyNeural, Phi/Mistral→en-US-EmmaNeural, "
+            "Nova (AWS)→en-US-JasonNeural, DigitalOcean OSS→en-US-TonyNeural, Puter→en-US-SaraNeural."
         ),
         "inputSchema": {
             "type": "object",
