@@ -275,7 +275,8 @@ async def _gcloud_list_models():
         return None
 
 CONFIG = {}
-_conversation_history = []          # list of {"role": ..., "content": ...}
+
+
 _cache = {}                         # simple in-memory cache for static responses
 _model_status = {}                  # track last error/status per model
 _stdout_lock = asyncio.Lock()
@@ -1565,7 +1566,7 @@ def _handle_configure(args):
     lines.append(f"  temp:        {CONFIG.get('temperature', '')}")
     lines.append("")
     lines.append("[Conversation]")
-    lines.append(f"  turns:       {len(_conversation_history) // 2} / {CONFIG.get('conversation_max_turns', '')}")
+    lines.append(f"  turns:       {len(get_history(CURRENT_SESSION)) // 2} / {CONFIG.get('conversation_max_turns', '')}")
     lines.append("")
     lines.append("[Multi-Chat]")
     dm = CONFIG.get("default_models", DEFAULTS["default_models"])
@@ -1865,7 +1866,7 @@ async def _handle_scan(client, progress_token):
             model_info.append((m, mtype, "Azure OpenAI", True, rname))
         else:
             # Not deployed — skip testing, will mark as "can deploy"
-            all_tests.append(asyncio.coroutine(lambda: ("not_deployed", {}, 0))() if False else None)
+            all_tests.append(None)
             model_info.append((m, "deployed", "Azure OpenAI", False, None))
 
     # Azure serverless — test against primary endpoint

@@ -299,7 +299,7 @@ def _build_request(provider: str, model: str, messages: list[dict],
                 {"Content-Type": "application/json"}, body)
 
     if provider == "puter":
-        key = cfg.get("puter_auth_token") or cfg.get("api_key") or cfg.get("llm_api_key", "")
+        key = cfg.get("puter_api_key") or cfg.get("puter_auth_token") or cfg.get("llm_api_key", "")
         if not key: raise LLMStreamError(provider, "No Puter auth token configured")
         return ("https://api.puter.com/puterai/openai/v1/chat/completions",
                 {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -393,35 +393,45 @@ def stream_chat(provider: str, model: str, messages: list[dict],
 
 async def astream_chat(provider: str, model: str, messages: list[dict],
                        system_prompt: Optional[str] = None,
-                       config: Optional[dict] = None) -> AsyncGenerator[str, None]:
+                       config: Optional[dict] = None,
+                       client=None) -> AsyncGenerator[str, None]:
     """Async generator yielding text tokens from an LLM provider.
 
     Uses ``httpx`` for HTTP. Suitable for asyncio callers (CCA MCP server).
+    Pass an existing ``httpx.AsyncClient`` via *client* to reuse connection
+    pools; if None, a throwaway client is created per call.
     Raises LLMStreamError on config errors, httpx.HTTPStatusError on HTTP failures.
     """
     import httpx
     c = _cfg(config)
     model = resolve_model(model, provider)
 
+    # Use caller's client if provided, otherwise create a throwaway one
+    async def _get_client():
+        if client:
+            # Wrap in a no-op context manager
+            class _Wrapper:
+                async def __aenter__(self): return client
+                async def __aexit__(self, *a): pass
+            return _Wrapper()
+        return httpx.AsyncClient(timeout=60.0)
+
     if provider == "bedrock":
         url, headers, payload = _build_bedrock_request(model, messages, system_prompt, c)
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream("POST", url, content=payload, headers=headers) as resp:
+        async with await _get_client() as c_http:
+            async with c_http.stream("POST", url, content=payload, headers=headers) as resp:
                 resp.raise_for_status()
                 buf = bytearray()
                 async for chunk in resp.aiter_bytes():
                     buf.extend(chunk)
-                    # Use for-loop instead of next()+StopIteration catch —
-                    # PEP 479 converts StopIteration to RuntimeError inside
-                    # async generators, breaking the catch pattern.
-                    # buf is mutated in-place by _extract_bedrock_tokens.
+                    # buf is mutated in-place by _extract_bedrock_tokens
                     for token in _extract_bedrock_tokens(buf):
                         yield token
         return
 
     url, headers, body = _build_request(provider, model, messages, system_prompt, c)
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        async with client.stream("POST", url, headers=headers, json=body) as resp:
+    async with await _get_client() as c_http:
+        async with c_http.stream("POST", url, headers=headers, json=body) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 token = _parse_sse_line(line, provider)
