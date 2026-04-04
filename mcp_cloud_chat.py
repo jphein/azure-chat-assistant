@@ -715,6 +715,11 @@ async def call_llm(client: httpx.AsyncClient, messages, progress_token=None, mod
     max_tokens = CONFIG.get("max_completion_tokens", 2048)
     temperature = CONFIG.get("temperature", 1.0)
 
+    # Auto-detect Responses API models even if model_type is set to "deployed"
+    _responses_api_models = ("codex", "deep-research", "gpt-5.4-pro", "gpt-5.4")
+    if model_type == "deployed" and any(p in deployment.lower() for p in _responses_api_models):
+        model_type = "codex"
+
     # Route to Bedrock if model type is bedrock (use deployment for model name)
     if model_type == "bedrock":
         return await call_bedrock(client, messages, progress_token, deployment)
