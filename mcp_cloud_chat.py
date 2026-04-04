@@ -540,7 +540,12 @@ async def call_bedrock_stream(client, messages, model_name="claude-opus-4.6"):
 # ── Codex Responses API ────────────────────────────────────────────────────
 
 async def call_codex(client: httpx.AsyncClient, messages, progress_token, deployment, model):
-    """Call Azure OpenAI Codex model via the Responses API. Returns (response_text, usage_dict, latency_ms)."""
+    """Call Azure OpenAI model via the Responses API with streaming.
+
+    Uses SSE streaming so agents get incremental output instead of waiting
+    for the entire reasoning + generation to complete (which can take 60-120s
+    for gpt-5.4-pro). Returns (response_text, usage_dict, latency_ms).
+    """
     # Resolve endpoint via deployment map (multi-region) or primary
     ep_info = _deployment_map.get(deployment)
     ep = ep_info["endpoint"] if ep_info else CONFIG.get("endpoint", "")
@@ -567,6 +572,7 @@ async def call_codex(client: httpx.AsyncClient, messages, progress_token, deploy
         "input": input_items,
         "reasoning": {"effort": reasoning_effort},
         "max_output_tokens": CONFIG.get("max_completion_tokens", 2048),
+        "stream": True,
     }
 
     headers = {
@@ -575,63 +581,78 @@ async def call_codex(client: httpx.AsyncClient, messages, progress_token, deploy
     }
 
     if progress_token:
-        await _send_progress(progress_token, 0.1, f"[{model}] Thinking (codex)...")
+        await _send_progress(progress_token, 0.1, f"[{model}] Thinking (codex streaming)...")
 
     t0 = time.perf_counter()
-
-    # Heartbeat ticker — keeps MCP client alive during long reasoning calls
-    async def _heartbeat():
-        pct = 0.15
-        while pct < 0.9:
-            await asyncio.sleep(5)
-            pct = min(pct + 0.05, 0.9)
-            elapsed = (time.perf_counter() - t0)
-            if progress_token:
-                await _send_progress(progress_token, pct, f"[{model}] Reasoning... ({elapsed:.0f}s)")
-    heartbeat = asyncio.create_task(_heartbeat()) if progress_token else None
+    response_text = ""
+    usage = {}
 
     try:
-        resp = await client.post(url, json=body, headers=headers, timeout=300.0)
+        async with client.stream("POST", url, json=body, headers=headers, timeout=300.0) as resp:
+            if resp.status_code == 404:
+                # Try other endpoints
+                fallback = await _try_endpoints_codex(client, deployment, model, messages, progress_token)
+                if fallback:
+                    resp_obj, _ = fallback
+                    latency = (time.perf_counter() - t0) * 1000
+                    data = resp_obj.json()
+                    for item in data.get("output", []):
+                        if item.get("type") == "message":
+                            for block in item.get("content", []):
+                                if block.get("type") == "output_text":
+                                    response_text += block.get("text", "")
+                    return response_text.strip() or "Error: No response from model.", data.get("usage", {}), latency
+                return f"Error 404: Deployment '{deployment}' not found.", {}, 0
+
+            if resp.status_code == 429:
+                _model_status[model] = "Rate Limited"
+                return f"**[{model}]** Rate limit hit.", {}, 0
+
+            if resp.status_code != 200:
+                await resp.aread()
+                _model_status[model] = f"Error {resp.status_code}"
+                return f"Error {resp.status_code}: {resp.text[:500]}", {}, 0
+
+            # Parse SSE stream
+            char_count = 0
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = event.get("type", "")
+
+                # Accumulate output text deltas
+                if event_type == "response.output_text.delta":
+                    delta = event.get("delta", "")
+                    if delta:
+                        response_text += delta
+                        char_count += len(delta)
+                        # Progress update every ~200 chars
+                        if progress_token and char_count % 200 < len(delta):
+                            elapsed = time.perf_counter() - t0
+                            await _send_progress(progress_token, min(0.9, 0.2 + char_count / 5000),
+                                                 f"[{model}] Generating... ({elapsed:.0f}s, {char_count} chars)")
+
+                # Capture usage from completed response
+                elif event_type == "response.completed":
+                    resp_data = event.get("response", {})
+                    usage = resp_data.get("usage", {})
+
         latency = (time.perf_counter() - t0) * 1000
+        _model_status[model] = "OK"
+        if progress_token:
+            await _send_progress(progress_token, 1.0, f"[{model}] Done ({latency:.0f}ms)")
+        return response_text.strip() if response_text else "Error: No response from model.", usage, latency
 
-        # If 404 on primary, try other endpoints
-        if resp.status_code == 404:
-            fallback = await _try_endpoints_codex(client, deployment, model, messages, progress_token)
-            if fallback:
-                resp, _ = fallback
-                latency = (time.perf_counter() - t0) * 1000
-
-        if resp.status_code == 200:
-            data = resp.json()
-            # Check for API-level error in response body
-            if data.get("error"):
-                err = data["error"]
-                err_msg = err.get("message", "") if isinstance(err, dict) else str(err)
-                _model_status[model] = f"Error"
-                return f"Error: {err_msg}", {}, latency
-            _model_status[model] = "OK"
-            # Extract text from Responses API output
-            response_text = ""
-            for item in data.get("output", []):
-                if item.get("type") == "message":
-                    for block in item.get("content", []):
-                        if block.get("type") == "output_text":
-                            response_text += block.get("text", "")
-            usage = data.get("usage", {})
-            if progress_token:
-                await _send_progress(progress_token, 1.0, f"[{model}] Done ({latency:.0f}ms)")
-            return response_text.strip() if response_text else "Error: No response from model.", usage, latency
-        elif resp.status_code == 429:
-            _model_status[model] = "Rate Limited"
-            return f"**[{model}]** Rate limit hit.", {}, 0
-        else:
-            _model_status[model] = f"Error {resp.status_code}"
-            return f"Error {resp.status_code}: {resp.text[:500]}", {}, latency
     except Exception as e:
         return f"Error ({type(e).__name__}): {e}" if str(e) else f"Error: {type(e).__name__} (no details)", {}, 0
-    finally:
-        if heartbeat:
-            heartbeat.cancel()
 
 
 # ── Multi-endpoint fallback ────────────────────────────────────────────────
