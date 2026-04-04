@@ -370,11 +370,9 @@ def stream_chat(provider: str, model: str, messages: list[dict],
             buf = bytearray()
             for chunk in resp.iter_content(chunk_size=4096):
                 buf.extend(chunk)
-                gen = _extract_bedrock_tokens(buf)
-                try:
-                    while True: yield next(gen)
-                except StopIteration as e:
-                    buf = e.value
+                # buf is mutated in-place by _extract_bedrock_tokens
+                for token in _extract_bedrock_tokens(buf):
+                    yield token
         finally:
             resp.close()
         return
@@ -413,11 +411,12 @@ async def astream_chat(provider: str, model: str, messages: list[dict],
                 buf = bytearray()
                 async for chunk in resp.aiter_bytes():
                     buf.extend(chunk)
-                    gen = _extract_bedrock_tokens(buf)
-                    try:
-                        while True: yield next(gen)
-                    except StopIteration as e:
-                        buf = e.value
+                    # Use for-loop instead of next()+StopIteration catch —
+                    # PEP 479 converts StopIteration to RuntimeError inside
+                    # async generators, breaking the catch pattern.
+                    # buf is mutated in-place by _extract_bedrock_tokens.
+                    for token in _extract_bedrock_tokens(buf):
+                        yield token
         return
 
     url, headers, body = _build_request(provider, model, messages, system_prompt, c)

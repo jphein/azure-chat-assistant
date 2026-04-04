@@ -590,6 +590,8 @@ async def call_codex(client: httpx.AsyncClient, messages, progress_token, deploy
     try:
         async with client.stream("POST", url, json=body, headers=headers, timeout=300.0) as resp:
             if resp.status_code == 404:
+                # Drain the 404 response so the connection pool stays clean
+                await resp.aread()
                 # Try other endpoints
                 fallback = await _try_endpoints_codex(client, deployment, model, messages, progress_token)
                 if fallback:
@@ -605,6 +607,7 @@ async def call_codex(client: httpx.AsyncClient, messages, progress_token, deploy
                 return f"Error 404: Deployment '{deployment}' not found.", {}, 0
 
             if resp.status_code == 429:
+                await resp.aread()
                 _model_status[model] = "Rate Limited"
                 return f"**[{model}]** Rate limit hit.", {}, 0
 
@@ -1140,7 +1143,7 @@ async def multi_chat(client, user_message, models=None, progress_token=None):
         if model_name in BEDROCK_MODELS or "claude" in ml or "anthropic" in ml or "nova" in ml or "llama4" in ml or "palmyra" in ml:
             return "bedrock"
         # Responses API models (codex, deep-research, pro reasoning)
-        if "codex" in ml or "deep-research" in ml or ml in ("gpt-5.4-pro",):
+        if any(p in ml for p in ("codex", "deep-research", "gpt-5.4-pro", "gpt-5.4")):
             return "codex"
         if any(p in ml for p in ("gpt", "o1", "o3", "o4")):
             return "deployed"
